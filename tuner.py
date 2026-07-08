@@ -628,6 +628,22 @@ def apply_sysctl_optimizations():
                 subprocess.run(["sudo", "sysctl", "-w", f"{key}={val}"], check=True, capture_output=True)
             except Exception as e:
                 print(f"    Failed to apply {key}: {e}")
+    elif OS_NAME == "Windows":
+        if not is_admin():
+            print("    Elevation required to tune TCP/IP parameters. Run as Administrator.")
+            return
+        optimizations = {
+            "autotuninglevel": "normal",
+            "rss": "enabled",
+            "fastopen": "enabled",
+            "ecncapability": "enabled"
+        }
+        for key, val in optimizations.items():
+            try:
+                print(f"    Setting TCP global {key} = {val}...")
+                subprocess.run(["netsh", "int", "tcp", "set", "global", f"{key}={val}"], check=True, capture_output=True)
+            except Exception as e:
+                print(f"    Failed to apply {key}: {e}")
 
 def main():
     scan_thread = threading.Thread(target=bg_scan_channels)
