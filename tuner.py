@@ -1,7 +1,6 @@
-__version__ = "0.0.1"
 #!/usr/bin/env python3
+__version__ = "0.0.1"
 import os
-import sys
 import platform
 import subprocess
 import time
@@ -327,7 +326,7 @@ def test_latency(host="1.1.1.1", count=5):
             probe_cmd = None
             
         if probe_cmd:
-            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=2.0)
             if probe_result.returncode == 0:
                 icmp_supported = True
     except Exception:
@@ -341,7 +340,7 @@ def test_latency(host="1.1.1.1", count=5):
             elif OS_NAME == "Windows":
                 cmd = ["ping", "-n", str(count), host]
                 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10.0)
             if result.returncode == 0:
                 latencies = []
                 for line in result.stdout.splitlines():
@@ -449,7 +448,7 @@ def discover_pmtu(icmp_supported, host="1.1.1.1"):
             else:
                 continue
                 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0)
             if result.returncode == 0 and "100%" not in result.stdout:
                 optimal_payload = size
                 break

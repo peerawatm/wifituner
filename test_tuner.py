@@ -121,7 +121,7 @@ class TestTunerMultiPlatform(unittest.TestCase):
         tuner.OS_NAME = "Linux"
         pmtu = tuner.discover_pmtu(icmp_supported=True, host="1.1.1.1")
         self.assertEqual(pmtu, 1500)
-        mock_run.assert_any_call(["ping", "-M", "do", "-s", "1472", "-c", "1", "-W", "1", "1.1.1.1"], capture_output=True, text=True)
+        mock_run.assert_any_call(["ping", "-M", "do", "-s", "1472", "-c", "1", "-W", "1", "1.1.1.1"], capture_output=True, text=True, timeout=2.0)
 
     @patch("platform.system", return_value="Windows")
     @patch("subprocess.run")
@@ -133,7 +133,7 @@ class TestTunerMultiPlatform(unittest.TestCase):
         tuner.OS_NAME = "Windows"
         pmtu = tuner.discover_pmtu(icmp_supported=True, host="1.1.1.1")
         self.assertEqual(pmtu, 1500)
-        mock_run.assert_any_call(["ping", "-f", "-l", "1472", "-n", "1", "-w", "1000", "1.1.1.1"], capture_output=True, text=True)
+        mock_run.assert_any_call(["ping", "-f", "-l", "1472", "-n", "1", "-w", "1000", "1.1.1.1"], capture_output=True, text=True, timeout=2.0)
 
     # --- scan_neighbor_channels ---
 
