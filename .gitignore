@@ -1,5 +1,22 @@
-# Pythone Caches
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
 
-# macOS
+# Linter & type checker caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Editor files
 .DS_Store
+*.swp
+*.swo
+*~
+
+# Local wifituner files
+.wifituner_backup.json
