@@ -652,6 +652,113 @@ class TestTunerMultiPlatform(unittest.TestCase):
         mock_run.assert_any_call(["sudo", "ifconfig", "en0", "mtu", "1500"], check=True)
         mock_remove.assert_called_once_with("/tmp/wifituner_test_backup.json")
 
+    @patch("platform.system", return_value="Darwin")
+    @patch("subprocess.run")
+    def test_get_wifi_interface_darwin(self, mock_run, mock_system):
+        tuner.OS_NAME = "Darwin"
+        mock_result = MagicMock()
+        mock_result.stdout = "Hardware Port: Wi-Fi\nDevice: en0\n"
+        mock_result.returncode = 0
+        mock_run.return_value = mock_result
+        self.assertEqual(tuner.get_wifi_interface(), "en0")
+
+    @patch("platform.system", return_value="FreeBSD")
+    @patch("subprocess.run")
+    def test_get_wifi_interface_bsd(self, mock_run, mock_system):
+        tuner.OS_NAME = "FreeBSD"
+        tuner.IS_BSD = True
+        mock_res1 = MagicMock()
+        mock_res1.stdout = "wlan0\n"
+        mock_res1.returncode = 0
+        mock_res2 = MagicMock()
+        mock_res2.stdout = "lo0 em0 wlan0\n"
+        mock_res2.returncode = 0
+        mock_run.side_effect = [mock_res1, mock_res2]
+        self.assertEqual(tuner.get_wifi_interface(), "wlan0")
+
+    @patch("platform.system", return_value="Darwin")
+    @patch("tuner.get_macos_service_name", return_value="Wi-Fi")
+    @patch("subprocess.run")
+    def test_get_dns_servers_darwin(self, mock_run, mock_service, mock_system):
+        tuner.OS_NAME = "Darwin"
+        mock_result = MagicMock()
+        mock_result.stdout = "1.1.1.1\n8.8.8.8\n"
+        mock_result.returncode = 0
+        mock_run.return_value = mock_result
+        self.assertEqual(tuner.get_dns_servers("en0"), ["1.1.1.1", "8.8.8.8"])
+
+    @patch("platform.system", return_value="Darwin")
+    @patch("tuner.get_macos_service_name", return_value="Wi-Fi")
+    @patch("subprocess.run")
+    def test_apply_dns_darwin(self, mock_run, mock_service, mock_system):
+        tuner.OS_NAME = "Darwin"
+        mock_run.return_value = MagicMock(returncode=0)
+        self.assertTrue(tuner.apply_dns("en0", "1.1.1.1"))
+        mock_run.assert_any_call(
+            ["sudo", "networksetup", "-setdnsservers", "Wi-Fi", "1.1.1.1"], check=True
+        )
+
+    @patch("platform.system", return_value="FreeBSD")
+    @patch("subprocess.run")
+    def test_apply_dns_bsd(self, mock_run, mock_system):
+        tuner.OS_NAME = "FreeBSD"
+        tuner.IS_BSD = True
+        mock_run.return_value = MagicMock(returncode=0)
+        self.assertTrue(tuner.apply_dns("wlan0", "1.1.1.1"))
+        mock_run.assert_called_with(
+            ["sudo", "sh", "-c", "echo 'nameserver 1.1.1.1' > /etc/resolv.conf"],
+            check=True,
+        )
+
+    @patch("platform.system", return_value="FreeBSD")
+    @patch("subprocess.run")
+    def test_apply_mtu_bsd(self, mock_run, mock_system):
+        tuner.OS_NAME = "FreeBSD"
+        tuner.IS_BSD = True
+        mock_run.return_value = MagicMock(returncode=0)
+        tuner.apply_mtu("wlan0", 1492)
+        mock_run.assert_called_with(
+            ["sudo", "ifconfig", "wlan0", "mtu", "1492"], check=True
+        )
+
+    @patch("subprocess.run")
+    def test_get_bsd_wifi_details(self, mock_run):
+        mock_result = MagicMock()
+        mock_result.stdout = "wlan0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>\n\tether 00:11:22:33:44:55\n\tssid CUHomeWiFi channel 128 (5180 MHz 11a) bssid 00:11:22:33:44:55\n"
+        mock_result.returncode = 0
+        mock_run.return_value = mock_result
+        details = tuner.get_bsd_wifi_details("wlan0")
+        self.assertEqual(details["SSID"], "CUHomeWiFi")
+        self.assertEqual(details["Channel"], "128")
+        self.assertEqual(details["BSSID"], "00:11:22:33:44:55")
+
+    @patch("platform.system", return_value="FreeBSD")
+    @patch("subprocess.run")
+    @patch("tuner._persist_sysctl")
+    def test_apply_sysctl_optimizations_bsd(self, mock_persist, mock_run, mock_system):
+        tuner.OS_NAME = "FreeBSD"
+        tuner.IS_BSD = True
+        mock_run.return_value = MagicMock(returncode=0)
+        tuner.apply_sysctl_optimizations()
+        mock_run.assert_any_call(
+            ["sudo", "sysctl", "-w", "net.inet.tcp.mssdflt=1460"],
+            check=True,
+            capture_output=True,
+        )
+
+    @patch("platform.system", return_value="FreeBSD")
+    @patch("builtins.open", new_callable=mock_open, read_data="nameserver 1.1.1.1\n")
+    def test_verify_dns_bsd_present(self, mock_file, mock_system):
+        tuner.OS_NAME = "FreeBSD"
+        tuner.IS_BSD = True
+        self.assertTrue(tuner.verify_dns("wlan0", "1.1.1.1"))
+
+    def test_build_dns_query(self):
+        query = tuner.build_dns_query("example.com")
+        self.assertEqual(query[-5:], b"\x00\x00\x01\x00\x01")
+        self.assertIn(b"example", query)
+        self.assertIn(b"com", query)
+
 
 if __name__ == "__main__":
     unittest.main()

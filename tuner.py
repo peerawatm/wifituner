@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 import os
 import argparse
 import functools
@@ -15,6 +15,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Check platform
 OS_NAME = platform.system()
+
+
+def is_bsd():
+    return OS_NAME.endswith("BSD") or "BSD" in OS_NAME
+
+
 # Band-keyed neighbor channel counts. Populated by bg_scan_channels() at runtime.
 neighbor_channels: dict[str, dict[str, int]] = {"2GHz": {}, "5GHz": {}, "6GHz": {}}
 
@@ -54,6 +60,47 @@ def get_wifi_interface():
         except Exception:
             pass  # non-fatal: returns "en0" as default
         return "en0"
+    elif is_bsd():
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "net.wlan.devices"], capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                ifconfig_res = subprocess.run(
+                    ["ifconfig", "-l"], capture_output=True, text=True
+                )
+                if ifconfig_res.returncode == 0:
+                    for part in ifconfig_res.stdout.split():
+                        if part.startswith("wlan"):
+                            return part
+            ifconfig_res = subprocess.run(
+                ["ifconfig", "-l"], capture_output=True, text=True
+            )
+            if ifconfig_res.returncode == 0:
+                parts = ifconfig_res.stdout.split()
+                for part in parts:
+                    if part.startswith("wlan"):
+                        return part
+                wifi_prefixes = (
+                    "iwn",
+                    "ath",
+                    "wpi",
+                    "run",
+                    "ral",
+                    "rsu",
+                    "rtwn",
+                    "malo",
+                    "otus",
+                    "urtwn",
+                    "pgt",
+                    "bwn",
+                )
+                for part in parts:
+                    if any(part.startswith(p) for p in wifi_prefixes):
+                        return part
+        except Exception:
+            pass
+        return "wlan0"
     elif OS_NAME == "Linux":
         try:
             if os.path.exists("/proc/net/wireless"):
@@ -336,6 +383,25 @@ def get_linux_wifi_details(interface):
     return details
 
 
+def get_bsd_wifi_details(interface: str) -> dict[str, str]:
+    details: dict[str, str] = {}
+    try:
+        result = subprocess.run(["ifconfig", interface], capture_output=True, text=True)
+        if result.returncode == 0:
+            match_ssid = re.search(r"\bssid\s+([^\s]+)", result.stdout)
+            if match_ssid:
+                details["SSID"] = match_ssid.group(1)
+            match_chan = re.search(r"\bchannel\s+(\d+)", result.stdout)
+            if match_chan:
+                details["Channel"] = match_chan.group(1)
+            match_bssid = re.search(r"\bbssid\s+([0-9a-fA-F:]+)", result.stdout)
+            if match_bssid:
+                details["BSSID"] = match_bssid.group(1)
+    except Exception:
+        pass
+    return details
+
+
 def get_current_wifi_details(interface):
     if OS_NAME == "Darwin":
         return get_macos_wifi_details()
@@ -343,6 +409,8 @@ def get_current_wifi_details(interface):
         return get_windows_wifi_details()
     elif OS_NAME == "Linux":
         return get_linux_wifi_details(interface)
+    elif is_bsd():
+        return get_bsd_wifi_details(interface)
     return {}
 
 
@@ -367,7 +435,7 @@ def get_dns_servers(interface):
         except Exception as e:
             _warn(f"networksetup -getdnsservers failed: {e}")
         return []
-    elif OS_NAME == "Linux":
+    elif OS_NAME == "Linux" or is_bsd():
         dns = []
         try:
             with open("/etc/resolv.conf", "r") as f:
@@ -744,6 +812,8 @@ def scan_neighbor_channels():
     Windows: netsh wlan; channel-number heuristic for band.
     """
     channels: dict[str, dict[str, int]] = {"2GHz": {}, "5GHz": {}, "6GHz": {}}
+    if is_bsd():
+        return channels
 
     def record_neighbor(ch_num, band, width):
         key = _classify_band(ch_num, band)
@@ -923,10 +993,15 @@ def apply_dns(interface, dns_ip):
     if OS_NAME == "Darwin":
         service = get_macos_service_name(interface)
         cmd = ["sudo", "networksetup", "-setdnsservers", service, dns_ip]
-    elif OS_NAME == "Linux":
+    elif OS_NAME == "Linux" or is_bsd():
         try:
-            subprocess.run(["resolvectl", "--version"], capture_output=True, check=True)
-            cmd = ["sudo", "resolvectl", "dns", interface, dns_ip]
+            if OS_NAME == "Linux":
+                subprocess.run(
+                    ["resolvectl", "--version"], capture_output=True, check=True
+                )
+                cmd = ["sudo", "resolvectl", "dns", interface, dns_ip]
+            else:
+                raise Exception("Not Linux")
         except Exception:
             cmd = ["sudo", "sh", "-c", f"echo 'nameserver {dns_ip}' > /etc/resolv.conf"]
     elif OS_NAME == "Windows":
@@ -974,20 +1049,25 @@ def verify_dns(interface, dns_ip):
             return dns_ip in [
                 line.strip() for line in result.stdout.splitlines() if line.strip()
             ]
-        elif OS_NAME == "Linux":
+        elif OS_NAME == "Linux" or is_bsd():
             # resolvectl-managed systems do not write to /etc/resolv.conf;
             # check resolvectl status first, fall back for non-systemd systems.
             try:
-                result = subprocess.run(
-                    ["resolvectl", "status", interface], capture_output=True, text=True
-                )
-                if result.returncode == 0:
-                    ip_pattern = re.compile(
-                        r"\b(?:\d{1,3}\.){3}\d{1,3}\b|(?:::[0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}:[0-9a-fA-F:]+)"
+                if OS_NAME == "Linux":
+                    result = subprocess.run(
+                        ["resolvectl", "status", interface],
+                        capture_output=True,
+                        text=True,
                     )
-                    ips = ip_pattern.findall(result.stdout)
-                    return dns_ip in ips
-            except FileNotFoundError:
+                    if result.returncode == 0:
+                        ip_pattern = re.compile(
+                            r"\b(?:\d{1,3}\.){3}\d{1,3}\b|(?:::[0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}:[0-9a-fA-F:]+)"
+                        )
+                        ips = ip_pattern.findall(result.stdout)
+                        return dns_ip in ips
+                else:
+                    raise Exception("Not Linux")
+            except Exception:
                 pass  # non-fatal: resolvectl absent; falls to /etc/resolv.conf
             with open("/etc/resolv.conf", "r") as f:
                 for line in f:
@@ -1014,7 +1094,7 @@ def verify_dns(interface, dns_ip):
 
 def apply_mtu(interface, mtu_size):
     print(f"[*] Applying MTU: Configuration targeting {mtu_size} bytes...")
-    if OS_NAME == "Darwin":
+    if OS_NAME == "Darwin" or is_bsd():
         cmd = ["sudo", "ifconfig", interface, "mtu", str(mtu_size)]
     elif OS_NAME == "Linux":
         cmd = ["sudo", "ip", "link", "set", "dev", interface, "mtu", str(mtu_size)]
@@ -1084,7 +1164,7 @@ def flush_dns_cache():
 # close the TOCTOU window that existed when the file was read as the current
 # user and then written via a separate sudo tee call.
 def _persist_sysctl(key, val):
-    if OS_NAME == "Darwin":
+    if OS_NAME == "Darwin" or is_bsd():
         conf_path = "/etc/sysctl.conf"
     elif OS_NAME == "Linux":
         conf_path = "/etc/sysctl.d/99-wifituner.conf"
@@ -1150,6 +1230,21 @@ def apply_sysctl_optimizations(gaming=False):
         optimizations = {
             "net.ipv4.tcp_slow_start_after_idle": "0",
             "net.ipv4.tcp_notsent_lowat": "16384",
+        }
+        for key, val in optimizations.items():
+            try:
+                print(f"    Setting {key} = {val}...")
+                subprocess.run(
+                    ["sudo", "sysctl", "-w", f"{key}={val}"],
+                    check=True,
+                    capture_output=True,
+                )
+                _persist_sysctl(key, val)
+            except Exception as e:
+                print(f"    Failed to apply {key}: {e}")
+    elif is_bsd():
+        optimizations = {
+            "net.inet.tcp.mssdflt": "1460",
         }
         for key, val in optimizations.items():
             try:
@@ -1250,7 +1345,7 @@ BACKUP_PATH = os.path.expanduser("~/.wifituner_backup.json")
 
 
 def get_current_mtu(interface):
-    if OS_NAME == "Darwin":
+    if OS_NAME == "Darwin" or is_bsd():
         try:
             result = subprocess.run(
                 ["ifconfig", interface], capture_output=True, text=True
@@ -1342,6 +1437,10 @@ def save_backup(interface: str) -> None:
         backup["sysctl"]["net.inet.tcp.delayed_ack"] = get_sysctl_value(
             "net.inet.tcp.delayed_ack"
         )
+    elif is_bsd():
+        backup["sysctl"]["net.inet.tcp.mssdflt"] = get_sysctl_value(
+            "net.inet.tcp.mssdflt"
+        )
     elif OS_NAME == "Linux":
         backup["sysctl"]["net.ipv4.tcp_slow_start_after_idle"] = get_sysctl_value(
             "net.ipv4.tcp_slow_start_after_idle"
@@ -1381,13 +1480,16 @@ def revert_optimizations(interface: str) -> None:
                 service = get_macos_service_name(interface)
                 cmd = ["sudo", "networksetup", "-setdnsservers", service] + dns_servers
                 subprocess.run(cmd, check=True)
-            elif OS_NAME == "Linux":
+            elif OS_NAME == "Linux" or is_bsd():
                 try:
-                    subprocess.run(
-                        ["resolvectl", "--version"], capture_output=True, check=True
-                    )
-                    cmd = ["sudo", "resolvectl", "dns", interface] + dns_servers
-                    subprocess.run(cmd, check=True)
+                    if OS_NAME == "Linux":
+                        subprocess.run(
+                            ["resolvectl", "--version"], capture_output=True, check=True
+                        )
+                        cmd = ["sudo", "resolvectl", "dns", interface] + dns_servers
+                        subprocess.run(cmd, check=True)
+                    else:
+                        raise Exception("Not Linux")
                 except Exception:
                     lines = [f"nameserver {ip}\n" for ip in dns_servers]
                     script = f"open('/etc/resolv.conf', 'w').writelines({lines!r})"
@@ -1436,9 +1538,12 @@ def revert_optimizations(interface: str) -> None:
                     ["sudo", "networksetup", "-setdnsservers", service, "empty"],
                     check=True,
                 )
-            elif OS_NAME == "Linux":
+            elif OS_NAME == "Linux" or is_bsd():
                 try:
-                    subprocess.run(["resolvectl", "revert", interface], check=True)
+                    if OS_NAME == "Linux":
+                        subprocess.run(["resolvectl", "revert", interface], check=True)
+                    else:
+                        raise Exception("Not Linux")
                 except Exception:
                     pass
             elif OS_NAME == "Windows":
@@ -1465,9 +1570,12 @@ def revert_optimizations(interface: str) -> None:
             subprocess.run(
                 ["sudo", "networksetup", "-setdnsservers", service, "empty"], check=True
             )
-        elif OS_NAME == "Linux":
+        elif OS_NAME == "Linux" or is_bsd():
             try:
-                subprocess.run(["resolvectl", "revert", interface], check=True)
+                if OS_NAME == "Linux":
+                    subprocess.run(["resolvectl", "revert", interface], check=True)
+                else:
+                    raise Exception("Not Linux")
             except Exception:
                 pass
         elif OS_NAME == "Windows":
@@ -1493,16 +1601,19 @@ def revert_optimizations(interface: str) -> None:
     flush_dns_cache()
 
     print("[*] Reverting Wi-Fi adapter power management...")
-    if OS_NAME == "Linux":
+    if OS_NAME == "Linux" or is_bsd():
         try:
-            subprocess.run(
-                ["sudo", "iw", "dev", interface, "set", "power_save", "on"],
-                check=True,
-                capture_output=True,
-            )
-            print("    Wi-Fi power saving re-enabled.")
+            if OS_NAME == "Linux":
+                subprocess.run(
+                    ["sudo", "iw", "dev", interface, "set", "power_save", "on"],
+                    check=True,
+                    capture_output=True,
+                )
+                print("    Wi-Fi power saving re-enabled.")
+            else:
+                pass  # Power saving is not optimized on BSD, so no revert action needed
         except Exception as e:
-            _warn(f"Failed to re-enable Wi-Fi power saving on Linux: {e}")
+            _warn(f"Failed to re-enable Wi-Fi power saving: {e}")
     elif OS_NAME == "Windows":
         if is_admin():
             try:
@@ -1536,6 +1647,26 @@ def revert_optimizations(interface: str) -> None:
             "net.inet.tcp.mssdflt": "512",
             "net.inet.tcp.win_scale_factor": "3",
             "net.inet.tcp.delayed_ack": "3",
+        }
+        sysctl_values = (
+            backup["sysctl"] if (backup and "sysctl" in backup) else default_sysctl
+        )
+        for key, val in default_sysctl.items():
+            backup_val = sysctl_values.get(key)
+            target_val = backup_val if backup_val else val
+            try:
+                subprocess.run(
+                    ["sudo", "sysctl", "-w", f"{key}={target_val}"],
+                    check=True,
+                    capture_output=True,
+                )
+                _persist_sysctl(key, target_val)
+            except Exception as e:
+                _warn(f"Failed to revert sysctl {key}: {e}")
+
+    elif is_bsd():
+        default_sysctl = {
+            "net.inet.tcp.mssdflt": "512",
         }
         sysctl_values = (
             backup["sysctl"] if (backup and "sysctl" in backup) else default_sysctl
