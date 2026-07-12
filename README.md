@@ -1,18 +1,19 @@
-# Wifituner - optimize your Wi-Fi connection.
+# Wifituner
+The Python script that optimize your Wi-Fi connection.
 
-## Run (All OS)
+## Clone && Run
 ```bash
 git clone https://github.com/peerawatm/wifituner.git
 cd wifituner
 make run
 ```
 
-# Roadmap and Status
+# Roadmap & Status
 
-|  #  | Step                                                    | Status |
-| :-: | ------------------------------------------------------- | :----: |
-|  1  | Multi-Platform Diagnostics                              |  Done  |
-|  2  | Robust Local Parsing                                    |  Done  |
-|  3  | Width-Aware Channel Selection                           |  Done  |
-|  4  | Deterministic Reversion                                 |  Done  |
-|  5  | Configurable Benchmarking                               |  Done  |
+|  #  | Step                                        | Status   |
+| :-: | ------------------------------------------- | :------: |
+|  1  | Pick the fastest DNS server                 | Done     |
+|  2  | Find the best MTU size                      | Done     |
+|  3  | Pick the least congested Wi-Fi channel      | Done     |
+|  4  | Undo all changes cleanly on exit or failure | Done     |
+|  5  | Run on macOS, Linux, Windows, and BSD       | Untested |

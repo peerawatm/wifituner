@@ -1,11 +1,6 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-.venv/
-env/
-venv/
-ENV/
 
 # Linter & type checker caches
 .mypy_cache/
@@ -15,8 +10,7 @@ ENV/
 .coverage.*
 htmlcov/
 
-
-# Editor files
+# Editor & OS
 .DS_Store
 *.swp
 *.swo

@@ -1281,9 +1281,36 @@ def apply_sysctl_optimizations(gaming=False):
                 print(f"    Failed to apply {key}: {e}")
 
 
-def apply_power_save_optimization(interface: str) -> bool:
+def apply_power_save_optimization(interface: str, gaming: bool = False) -> bool:
     print("[*] Tuning Wi-Fi adapter power management...")
-    if OS_NAME == "Linux":
+    if OS_NAME == "Darwin":
+        if not gaming:
+            return False
+        try:
+            result = subprocess.run(
+                ["pmset", "-g"],
+                capture_output=True,
+                text=True,
+            )
+            sleep_val = "1"
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("sleep"):
+                    parts = stripped.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        sleep_val = parts[1]
+                        break
+            subprocess.run(
+                ["sudo", "pmset", "-a", "sleep", "0"],
+                check=True,
+                capture_output=True,
+            )
+            print(f"    System sleep disabled (was {sleep_val}). Wi-Fi radio stays fully active.")
+            return True
+        except Exception as e:
+            _warn(f"Failed to disable system sleep on macOS: {e}")
+            return False
+    elif OS_NAME == "Linux":
         try:
             subprocess.run(
                 ["sudo", "iw", "dev", interface, "set", "power_save", "off"],
@@ -1451,6 +1478,18 @@ def save_backup(interface: str) -> None:
     elif OS_NAME == "Windows":
         backup["sysctl"] = get_windows_tcp_settings()
         backup["roaming_aggressiveness"] = get_windows_roaming_aggressiveness(interface)
+    if OS_NAME == "Darwin":
+        try:
+            result = subprocess.run(["pmset", "-g"], capture_output=True, text=True)
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("sleep"):
+                    parts = stripped.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        backup["pmset_sleep"] = parts[1]
+                        break
+        except Exception:
+            pass
 
     try:
         with open(BACKUP_PATH, "w") as f:
@@ -1601,7 +1640,18 @@ def revert_optimizations(interface: str) -> None:
     flush_dns_cache()
 
     print("[*] Reverting Wi-Fi adapter power management...")
-    if OS_NAME == "Linux" or is_bsd():
+    if OS_NAME == "Darwin":
+        sleep_val = backup.get("pmset_sleep", "1") if backup else "1"
+        try:
+            subprocess.run(
+                ["sudo", "pmset", "-a", "sleep", sleep_val],
+                check=True,
+                capture_output=True,
+            )
+            print(f"    System sleep restored to {sleep_val}.")
+        except Exception as e:
+            _warn(f"Failed to restore system sleep on macOS: {e}")
+    elif OS_NAME == "Linux" or is_bsd():
         try:
             if OS_NAME == "Linux":
                 subprocess.run(
@@ -1750,36 +1800,35 @@ def revert_optimizations(interface: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Automated Wi-Fi Connection Analyzer & Optimizer"
+        description="Wi-Fi analyzer and optimizer."
     )
     parser.add_argument(
         "--gaming",
         action="store_true",
-        help="Enable gaming/low-latency mode: disables TCP delayed ACK (net.inet.tcp.delayed_ack=0). "
-        "Reduces interactive latency but may decrease bulk-transfer throughput.",
+        help="Disable TCP delayed ACK for lower latency (trades bulk throughput).",
     )
     parser.add_argument(
         "--revert",
         action="store_true",
-        help="Revert all applied DNS, MTU, and TCP/IP optimizations to system defaults.",
+        help="Undo all applied changes and restore system defaults.",
     )
     parser.add_argument(
         "--domains",
         type=str,
         default="google.com,cloudflare.com,github.com,wikipedia.org",
-        help="Comma-separated list of domains to use for DNS benchmarking.",
+        help="Domains for DNS benchmarking (comma-separated).",
     )
     parser.add_argument(
         "--ping-host",
         type=str,
         default="1.1.1.1",
-        help="Target IP host for latency and PMTU tests.",
+        help="Host for latency and MTU tests.",
     )
     parser.add_argument(
         "--dns-timeout",
         type=float,
         default=0.8,
-        help="Timeout value in seconds for DNS queries.",
+        help="DNS query timeout in seconds.",
     )
     args = parser.parse_args()
 
@@ -1802,7 +1851,7 @@ def main():
     print(f"Platform: {OS_NAME}")
     if args.gaming:
         print(
-            "[Gaming Mode] TCP delayed ACK will be disabled (net.inet.tcp.delayed_ack=0)."
+            "[Gaming Mode] TCP delayed ACK disabled + system sleep disabled (Wi-Fi radio stays fully active)."
         )
 
     print(f"Interface: {interface}")
@@ -1908,7 +1957,7 @@ def main():
     apply_sysctl_optimizations(gaming=args.gaming)
 
     # 7e. Apply Wi-Fi power-saving and roaming aggressiveness optimizations
-    apply_power_save_optimization(interface)
+    apply_power_save_optimization(interface, gaming=args.gaming)
     if OS_NAME == "Windows":
         print("[*] Tuning Roaming Aggressiveness (setting to Medium-Low)...")
         set_windows_roaming_aggressiveness(interface, "2")
