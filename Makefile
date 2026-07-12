@@ -31,5 +31,5 @@ typecheck:
 	uvx mypy --check-untyped-defs tuner.py
 
 clean:
-	rm -rf __pycache__ .mypy_cache .ruff_cache .pytest_cache
+	rm -rf __pycache__ .mypy_cache .ruff_cache .pytest_cache .coverage .coverage.* htmlcov
 	find . -name "*.pyc" -delete

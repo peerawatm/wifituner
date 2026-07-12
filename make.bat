@@ -10,7 +10,8 @@ if "%1"=="run" (
 ) else if "%1"=="typecheck" (
     uvx mypy --check-untyped-defs tuner.py
 ) else if "%1"=="clean" (
-    rmdir /s /q __pycache__ .mypy_cache .ruff_cache .pytest_cache 2>nul
+    rmdir /s /q __pycache__ .mypy_cache .ruff_cache .pytest_cache htmlcov 2>nul
+    del /f /q .coverage .coverage.* 2>nul
     del /s /q *.pyc 2>nul
 ) else (
     echo Available commands:
