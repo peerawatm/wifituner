@@ -1208,8 +1208,15 @@ def apply_sysctl_optimizations(gaming=False):
     )
     if OS_NAME == "Darwin":
         optimizations = {
-            "net.inet.tcp.mssdflt": "1460",  # Optimal segment size (avoids fragmentation overhead)
+            "net.inet.tcp.mssdflt": "1460",  # Optimal IPv4 segment size (avoids fragmentation overhead)
+            "net.inet.tcp.v6mssdflt": "1440",  # Optimal IPv6 segment size (eliminates 40% IPv6 packet overhead)
             "net.inet.tcp.win_scale_factor": "8",  # Expands receive window size limit
+            "net.inet.tcp.sendspace": "1048576",  # Expand send buffer to 1MB
+            "net.inet.tcp.recvspace": "1048576",  # Expand receive buffer to 1MB
+            "net.inet.tcp.fastopen": "3",  # Enable TCP Fast Open (client & server)
+            "net.inet.tcp.always_keepalive": "1",  # Force TCP keep-alive on all sockets
+            "net.inet.tcp.keepidle": "30000",  # Probe idle sockets after 30s (prevents NAT drop)
+            "net.inet.tcp.keepintvl": "5000",  # Keep-alive retry interval 5s
         }
         if gaming:
             optimizations["net.inet.tcp.delayed_ack"] = (
@@ -1305,7 +1312,9 @@ def apply_power_save_optimization(interface: str, gaming: bool = False) -> bool:
                 check=True,
                 capture_output=True,
             )
-            print(f"    System sleep disabled (was {sleep_val}). Wi-Fi radio stays fully active.")
+            print(
+                f"    System sleep disabled (was {sleep_val}). Wi-Fi radio stays fully active."
+            )
             return True
         except Exception as e:
             _warn(f"Failed to disable system sleep on macOS: {e}")
@@ -1368,7 +1377,23 @@ def set_windows_roaming_aggressiveness(interface: str, value: str) -> bool:
     return False
 
 
-BACKUP_PATH = os.path.expanduser("~/.wifituner_backup.json")
+def _get_backup_path() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        repo_root = result.stdout.strip()
+        return os.path.join(repo_root, ".wifituner_backup.json")
+    except Exception:
+        # Fallback to the directory containing tuner.py
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(script_dir, ".wifituner_backup.json")
+
+
+BACKUP_PATH = _get_backup_path()
 
 
 def get_current_mtu(interface):
@@ -1458,11 +1483,32 @@ def save_backup(interface: str) -> None:
         backup["sysctl"]["net.inet.tcp.mssdflt"] = get_sysctl_value(
             "net.inet.tcp.mssdflt"
         )
+        backup["sysctl"]["net.inet.tcp.v6mssdflt"] = get_sysctl_value(
+            "net.inet.tcp.v6mssdflt"
+        )
         backup["sysctl"]["net.inet.tcp.win_scale_factor"] = get_sysctl_value(
             "net.inet.tcp.win_scale_factor"
         )
         backup["sysctl"]["net.inet.tcp.delayed_ack"] = get_sysctl_value(
             "net.inet.tcp.delayed_ack"
+        )
+        backup["sysctl"]["net.inet.tcp.sendspace"] = get_sysctl_value(
+            "net.inet.tcp.sendspace"
+        )
+        backup["sysctl"]["net.inet.tcp.recvspace"] = get_sysctl_value(
+            "net.inet.tcp.recvspace"
+        )
+        backup["sysctl"]["net.inet.tcp.fastopen"] = get_sysctl_value(
+            "net.inet.tcp.fastopen"
+        )
+        backup["sysctl"]["net.inet.tcp.always_keepalive"] = get_sysctl_value(
+            "net.inet.tcp.always_keepalive"
+        )
+        backup["sysctl"]["net.inet.tcp.keepidle"] = get_sysctl_value(
+            "net.inet.tcp.keepidle"
+        )
+        backup["sysctl"]["net.inet.tcp.keepintvl"] = get_sysctl_value(
+            "net.inet.tcp.keepintvl"
         )
     elif is_bsd():
         backup["sysctl"]["net.inet.tcp.mssdflt"] = get_sysctl_value(
@@ -1695,8 +1741,15 @@ def revert_optimizations(interface: str) -> None:
     if OS_NAME == "Darwin":
         default_sysctl = {
             "net.inet.tcp.mssdflt": "512",
+            "net.inet.tcp.v6mssdflt": "1024",
             "net.inet.tcp.win_scale_factor": "3",
             "net.inet.tcp.delayed_ack": "3",
+            "net.inet.tcp.sendspace": "524288",
+            "net.inet.tcp.recvspace": "524288",
+            "net.inet.tcp.fastopen": "3",
+            "net.inet.tcp.always_keepalive": "0",
+            "net.inet.tcp.keepidle": "7200000",
+            "net.inet.tcp.keepintvl": "75000",
         }
         sysctl_values = (
             backup["sysctl"] if (backup and "sysctl" in backup) else default_sysctl
@@ -1799,9 +1852,7 @@ def revert_optimizations(interface: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Wi-Fi analyzer and optimizer."
-    )
+    parser = argparse.ArgumentParser(description="Wi-Fi analyzer and optimizer.")
     parser.add_argument(
         "--gaming",
         action="store_true",
