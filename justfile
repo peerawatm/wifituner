@@ -1,10 +1,6 @@
-# Cross-platform justfile for wifituner
-
 python := if os() == "windows" { "python" } else { "python3" }
 
-default: run
-
-# Run wifituner analyzer & optimizer
+default: run 
 run *args="":
     {{ python }} tuner.py {{ args }}
 
@@ -15,7 +11,7 @@ test *args="":
     uvx ruff check --select F,SIM,B,UP,C4,A,PIE,RET,I,N,FURB tuner.py test_tuner.py
     uvx mypy --check-untyped-defs tuner.py
 
-# Remove build caches and temporary files
+# Remove build files
 [unix]
 clean:
     rm -rf __pycache__ .mypy_cache .ruff_cache .pytest_cache .coverage .coverage.* htmlcov

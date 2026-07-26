@@ -11,14 +11,10 @@ import random
 import re
 import socket
 import subprocess
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# Check platform
 OS_NAME = platform.system()
-_AIRPORT_LOCK = threading.Lock()
-
 
 def is_bsd() -> bool:
     return OS_NAME.endswith("BSD") or "BSD" in OS_NAME
@@ -94,6 +90,32 @@ def _warn(msg: str) -> None:
     print(f"    [warn] {msg}")
 
 
+def _cmd(args, timeout: float | None = None, check: bool = False) -> str | None:
+    kwargs = {"capture_output": True, "text": True}
+    if check:
+        kwargs["check"] = True
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    try:
+        res = subprocess.run(args, **kwargs)
+        return res.stdout if res.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _run_ok(args, timeout: float | None = None, capture_output: bool = True) -> bool:
+    kwargs = {"check": True}
+    if capture_output:
+        kwargs["capture_output"] = True
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    try:
+        res = subprocess.run(args, **kwargs)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def is_admin():
     try:
         if OS_NAME == "Windows":
@@ -122,58 +144,32 @@ def ensure_admin() -> None:
 
 def get_wifi_interface():
     if OS_NAME == "Darwin":
-        try:
-            result = subprocess.run(
-                ["networksetup", "-listallhardwareports"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            pattern = re.compile(
-                r"Hardware Port:\s*Wi-Fi\s*\nDevice:\s*([a-zA-Z0-9]+)", re.MULTILINE
-            )
-            match = pattern.search(result.stdout)
+        res = _cmd(["networksetup", "-listallhardwareports"], check=True)
+        if res:
+            match = re.search(r"Hardware Port:\s*Wi-Fi\s*\nDevice:\s*([a-zA-Z0-9]+)", res, re.MULTILINE)
             if match:
                 return match.group(1)
-        except Exception:
-            pass  # non-fatal: returns "en0" as default
         return "en0"
     if is_bsd():
-        try:
-            ifconfig_res = subprocess.run(
-                ["ifconfig", "-l"], capture_output=True, text=True
+        res = _cmd(["ifconfig", "-l"])
+        if res:
+            parts = res.split()
+            for part in parts:
+                if part.startswith("wlan"):
+                    return part
+            wifi_prefixes = (
+                "iwn", "ath", "wpi", "run", "ral", "rsu",
+                "rtwn", "malo", "otus", "urtwn", "pgt", "bwn",
             )
-            if ifconfig_res.returncode == 0:
-                parts = ifconfig_res.stdout.split()
-                for part in parts:
-                    if part.startswith("wlan"):
-                        return part
-                wifi_prefixes = (
-                    "iwn",
-                    "ath",
-                    "wpi",
-                    "run",
-                    "ral",
-                    "rsu",
-                    "rtwn",
-                    "malo",
-                    "otus",
-                    "urtwn",
-                    "pgt",
-                    "bwn",
-                )
-                for part in parts:
-                    if any(part.startswith(p) for p in wifi_prefixes):
-                        return part
-        except Exception:
-            pass
+            for part in parts:
+                if any(part.startswith(p) for p in wifi_prefixes):
+                    return part
         return "wlan0"
     if OS_NAME == "Linux":
         try:
             if os.path.exists("/proc/net/wireless"):
                 with open("/proc/net/wireless") as f:
-                    lines = f.readlines()
-                    for line in lines[2:]:
+                    for line in f.readlines()[2:]:
                         parts = line.split()
                         if parts:
                             return parts[0].strip(":")
@@ -183,279 +179,137 @@ def get_wifi_interface():
                 ):
                     return d
         except Exception:
-            pass  # non-fatal: returns "wlan0" as default
+            pass
         return "wlan0"
     if OS_NAME == "Windows":
-        try:
-            result = subprocess.run(
-                ["netsh", "wlan", "show", "interfaces"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            for line in result.stdout.splitlines():
-                if "Name" in line:
-                    parts = line.split(":", 1)
-                    if len(parts) > 1:
-                        return parts[1].strip()
-        except Exception:
-            pass  # non-fatal: returns "Wi-Fi" as default
+        res = _cmd(["netsh", "wlan", "show", "interfaces"], check=True)
+        if res:
+            for line in res.splitlines():
+                if "Name" in line and ":" in line:
+                    return line.split(":", 1)[1].strip()
         return "Wi-Fi"
     return "wlan0"
 
 
 @functools.cache
 def get_macos_service_name(interface):
-    try:
-        result = subprocess.run(
-            ["networksetup", "-listallhardwareports"], capture_output=True, text=True
-        )
-        lines = result.stdout.splitlines()
+    res = _cmd(["networksetup", "-listallhardwareports"])
+    if res:
         current_service = None
-        for line in lines:
+        for line in res.splitlines():
             if "Hardware Port:" in line:
                 current_service = line.split("Hardware Port:", 1)[1].strip()
-            if "Device:" in line:
-                dev = line.split("Device:", 1)[1].strip()
-                if dev == interface:
-                    return current_service
-    except Exception:
-        pass  # non-fatal: returns "Wi-Fi" as fallback
+            if "Device:" in line and line.split("Device:", 1)[1].strip() == interface:
+                return current_service
     return "Wi-Fi"
 
 
 def get_macos_wifi_details(interface="en0"):
     details = {}
-    try:
-        res = subprocess.run(
-            ["ipconfig", "getsummary", interface],
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-        )
-        if res.returncode == 0:
-            for line in res.stdout.splitlines():
-                line_str = line.strip()
-                if line_str.startswith("SSID :"):
-                    details["SSID"] = line_str.split(":", 1)[1].strip()
-                elif line_str.startswith("Security :"):
-                    details["Security"] = line_str.split(":", 1)[1].strip()
-                elif line_str.startswith("Router :"):
-                    details["Gateway"] = line_str.split(":", 1)[1].strip()
-    except Exception:
-        pass
+    res = _cmd(["ipconfig", "getsummary", interface], timeout=1.0)
+    if res:
+        for line in res.splitlines():
+            s = line.strip()
+            if s.startswith("SSID :"):
+                details["SSID"] = s.split(":", 1)[1].strip()
+            elif s.startswith("Security :"):
+                details["Security"] = s.split(":", 1)[1].strip()
+            elif s.startswith("Router :"):
+                details["Gateway"] = s.split(":", 1)[1].strip()
 
-    try:
-        ip_res = subprocess.run(
-            ["ipconfig", "getifaddr", interface],
-            capture_output=True,
-            text=True,
-            timeout=0.5,
-        )
-        if ip_res.returncode == 0 and ip_res.stdout.strip():
-            details["IP Address"] = ip_res.stdout.strip()
-    except Exception:
-        pass
+    ip = _cmd(["ipconfig", "getifaddr", interface], timeout=0.5)
+    if ip and ip.strip():
+        details["IP Address"] = ip.strip()
 
     if not details.get("SSID"):
-        try:
-            res = subprocess.run(
-                ["networksetup", "-getairportnetwork", interface],
-                capture_output=True,
-                text=True,
-                timeout=1.0,
-            )
-            if res.returncode == 0 and "Current Wi-Fi Network:" in res.stdout:
-                details["SSID"] = res.stdout.split("Current Wi-Fi Network:", 1)[
-                    1
-                ].strip()
-        except Exception:
-            pass
+        res = _cmd(["networksetup", "-getairportnetwork", interface], timeout=1.0)
+        if res and "Current Wi-Fi Network:" in res:
+            details["SSID"] = res.split("Current Wi-Fi Network:", 1)[1].strip()
 
-    return details
-
-
-def _get_macos_wifi_details_slow():
-    details: dict[str, str] = {}
-    try:
-        result = subprocess.run(
-            ["system_profiler", "SPAirPortDataType"], capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            return details
-
-        lines = result.stdout.splitlines()
-        in_current_net = False
-        ssid = None
-        indent_level = 0
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-
-            if "Current Network Information:" in line:
-                in_current_net = True
-                indent_level = len(line) - len(line.lstrip())
-                continue
-
-            if in_current_net:
-                current_indent = len(line) - len(line.lstrip())
-                if current_indent <= indent_level and stripped != "":
-                    in_current_net = False
-                    continue
-
-                if ssid is None and current_indent > indent_level:
-                    ssid = stripped.rstrip(":")
-                    details["SSID"] = ssid
-                    continue
-
-                if ":" in stripped:
-                    key, val = stripped.split(":", 1)
-                    key = key.strip()
-                    val = val.strip()
-                    if key == "PHY Mode":
-                        details["PHY Mode"] = val
-                    elif key == "Channel":
-                        details["Channel"] = val
-                    elif key == "Security":
-                        details["Security"] = val
-                    elif key == "Signal / Noise":
-                        details["Signal / Noise"] = val
-                        match = re.search(r"(-?\d+)\s*dBm\s*/\s*(-?\d+)\s*dBm", val)
-                        if match:
-                            details["RSSI"] = f"{match.group(1)} dBm"
-                            details["Noise"] = f"{match.group(2)} dBm"
-                            details["SNR"] = (
-                                f"{int(match.group(1)) - int(match.group(2))} dB"
-                            )
-                    elif key == "Transmit Rate":
-                        details["Transmit Rate"] = f"{val} Mbps"
-    except Exception as e:
-        _warn(f"system_profiler text parse failed: {e}")
     return details
 
 
 def get_windows_wifi_details():
     details: dict[str, str] = {}
-    try:
-        result = subprocess.run(
-            ["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            return details
-
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            if not stripped or ":" not in stripped:
-                continue
-            key, val = stripped.split(":", 1)
-            key = key.strip().lower()
-            val = val.strip()
-
-            if key == "ssid":
-                details["SSID"] = val
-            elif "radio" in key or "funktyp" in key:
-                details["PHY Mode"] = val
-            elif "channel" in key or "kanal" in key or "canal" in key:
-                details["Channel"] = val
-            elif "auth" in key or "sec" in key:
-                details["Security"] = val
-            elif "signal" in key or "señal" in key or "segnale" in key:
-                details["RSSI"] = val
-            elif (
-                "transmit" in key
-                or "transmission" in key
-                or "übertrag" in key
-                or "velocidad de trans" in key
-                or "velocità di trans" in key
-            ):
-                details["Transmit Rate"] = (
-                    f"{val} Mbps" if "mbps" not in val.lower() else val
-                )
-    except Exception as e:
-        _warn(f"netsh wlan show interfaces failed: {e}")
+    res = _cmd(["netsh", "wlan", "show", "interfaces"])
+    if not res:
+        return details
+    for line in res.splitlines():
+        s = line.strip()
+        if not s or ":" not in s:
+            continue
+        key, val = s.split(":", 1)
+        k, v = key.strip().lower(), val.strip()
+        if k == "ssid":
+            details["SSID"] = v
+        elif any(x in k for x in ("radio", "funktyp")):
+            details["PHY Mode"] = v
+        elif any(x in k for x in ("channel", "kanal", "canal")):
+            details["Channel"] = v
+        elif any(x in k for x in ("auth", "sec")):
+            details["Security"] = v
+        elif any(x in k for x in ("signal", "señal", "segnale")):
+            details["RSSI"] = v
+        elif any(x in k for x in ("transmit", "transmission", "übertrag", "velocidad de trans", "velocità di trans")):
+            details["Transmit Rate"] = f"{v} Mbps" if "mbps" not in v.lower() else v
     return details
 
 
 def get_linux_wifi_details(interface):
     details = {}
-    try:
-        result = subprocess.run(
-            ["iw", "dev", interface, "link"], capture_output=True, text=True
-        )
-        if result.returncode == 0 and "Not connected" not in result.stdout:
-            for line in result.stdout.splitlines():
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                if stripped.startswith("SSID:"):
-                    details["SSID"] = stripped.split("SSID:", 1)[1].strip()
-                elif stripped.startswith("freq:"):
-                    freq_mhz = stripped.split("freq:", 1)[1].strip()
-                    try:
-                        freq = int(freq_mhz)
-                        if freq >= 5925:
-                            details["Channel"] = f"{freq} MHz (6GHz)"
-                        elif freq >= 5000:
-                            details["Channel"] = f"{freq} MHz (5GHz)"
-                        elif freq >= 2400:
-                            details["Channel"] = f"{freq} MHz (2.4GHz)"
-                    except ValueError:
-                        details["Channel"] = (
-                            freq_mhz  # non-fatal: raw freq string used as-is
-                        )
-                elif stripped.startswith("signal:"):
-                    details["RSSI"] = stripped.split("signal:", 1)[1].strip()
-                elif stripped.startswith("tx bitrate:"):
-                    details["Transmit Rate"] = stripped.split("tx bitrate:", 1)[
-                        1
-                    ].strip()
-            if "SSID" in details:
-                details["PHY Mode"] = "802.11 (Linux iw)"
-                details["Security"] = "Enterprise/Personal"
-                return details
+    res = _cmd(["iw", "dev", interface, "link"])
+    if res and "Not connected" not in res:
+        for line in res.splitlines():
+            s = line.strip()
+            if s.startswith("SSID:"):
+                details["SSID"] = s.split("SSID:", 1)[1].strip()
+            elif s.startswith("freq:"):
+                freq_mhz = s.split("freq:", 1)[1].strip()
+                try:
+                    freq = int(freq_mhz)
+                    band = "6GHz" if freq >= 5925 else "5GHz" if freq >= 5000 else "2.4GHz" if freq >= 2400 else None
+                    details["Channel"] = f"{freq} MHz ({band})" if band else freq_mhz
+                except ValueError:
+                    details["Channel"] = freq_mhz
+            elif s.startswith("signal:"):
+                details["RSSI"] = s.split("signal:", 1)[1].strip()
+            elif s.startswith("tx bitrate:"):
+                details["Transmit Rate"] = s.split("tx bitrate:", 1)[1].strip()
+        if "SSID" in details:
+            details["PHY Mode"] = "802.11 (Linux iw)"
+            details["Security"] = "Enterprise/Personal"
+            return details
 
-        result = subprocess.run(["iwconfig", interface], capture_output=True, text=True)
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                if "ESSID:" in line:
-                    match = re.search(r'ESSID:"([^"]+)"', line)
-                    if match:
-                        details["SSID"] = match.group(1)
-                if "Frequency:" in line:
-                    match = re.search(r"Frequency:([\d\.]+)\s*GHz", line)
-                    if match:
-                        details["Channel"] = f"{match.group(1)} GHz"
-                if "Bit Rate" in line:
-                    match = re.search(r"Bit Rate=([\d\.]+)\s*Mb/s", line)
-                    if match:
-                        details["Transmit Rate"] = f"{match.group(1)} Mbps"
-                if "Signal level" in line:
-                    match = re.search(r"Signal level=(-?\d+)\s*dBm", line)
-                    if match:
-                        details["RSSI"] = f"{match.group(1)} dBm"
-    except Exception as e:
-        _warn(f"iw/iwconfig query failed: {e}")
+    res2 = _cmd(["iwconfig", interface])
+    if res2:
+        for line in res2.splitlines():
+            if "ESSID:" in line:
+                m = re.search(r'ESSID:"([^"]+)"', line)
+                if m:
+                    details["SSID"] = m.group(1)
+            if "Frequency:" in line:
+                m = re.search(r"Frequency:([\d\.]+)\s*GHz", line)
+                if m:
+                    details["Channel"] = f"{m.group(1)} GHz"
+            if "Bit Rate" in line:
+                m = re.search(r"Bit Rate=([\d\.]+)\s*Mb/s", line)
+                if m:
+                    details["Transmit Rate"] = f"{m.group(1)} Mbps"
+            if "Signal level" in line:
+                m = re.search(r"Signal level=(-?\d+)\s*dBm", line)
+                if m:
+                    details["RSSI"] = f"{m.group(1)} dBm"
     return details
 
 
 def get_bsd_wifi_details(interface: str) -> dict[str, str]:
     details: dict[str, str] = {}
-    try:
-        result = subprocess.run(["ifconfig", interface], capture_output=True, text=True)
-        if result.returncode == 0:
-            match_ssid = re.search(r"\bssid\s+([^\s]+)", result.stdout)
-            if match_ssid:
-                details["SSID"] = match_ssid.group(1)
-            match_chan = re.search(r"\bchannel\s+(\d+)", result.stdout)
-            if match_chan:
-                details["Channel"] = match_chan.group(1)
-            match_bssid = re.search(r"\bbssid\s+([0-9a-fA-F:]+)", result.stdout)
-            if match_bssid:
-                details["BSSID"] = match_bssid.group(1)
-    except Exception:
-        pass
+    res = _cmd(["ifconfig", interface])
+    if res:
+        for pat, key in [(r"\bssid\s+([^\s]+)", "SSID"), (r"\bchannel\s+(\d+)", "Channel"), (r"\bbssid\s+([0-9a-fA-F:]+)", "BSSID")]:
+            m = re.search(pat, res)
+            if m:
+                details[key] = m.group(1)
     return details
 
 
@@ -532,13 +386,7 @@ def get_dns_servers(interface):
                         dns.extend(ips)
             except Exception as e:
                 _warn(f"netsh interface {family_cmd} show dns failed: {e}")
-        seen = set()
-        deduped = []
-        for ip in dns:
-            if ip not in seen:
-                seen.add(ip)
-                deduped.append(ip)
-        return deduped
+        return list(dict.fromkeys(dns))
     return []
 
 
@@ -560,54 +408,37 @@ def test_tcp_latency(host="1.1.1.1", port=443, count=5):
 
 
 def test_latency(host="1.1.1.1", count=2):
-    icmp_supported = False
-    try:
-        if OS_NAME in ("Darwin", "Linux"):
-            probe_cmd = (
-                ["ping", "-c", "1", "-t", "1", host]
-                if OS_NAME == "Darwin"
-                else ["ping", "-c", "1", "-W", "1", host]
-            )
-        elif OS_NAME == "Windows":
-            probe_cmd = ["ping", "-n", "1", "-w", "1000", host]
-        else:
-            probe_cmd = None
-
-        if probe_cmd:
-            probe_result = subprocess.run(
-                probe_cmd, capture_output=True, text=True, timeout=2.0
-            )
-            if probe_result.returncode == 0:
-                icmp_supported = True
-    except Exception:
-        pass  # non-fatal: ICMP unavailable; falls to TCP
-
-    if icmp_supported:
-        try:
-            cmd = []
-            if OS_NAME in ("Darwin", "Linux"):
-                cmd = ["ping", "-c", str(count), "-i", "0.1", host]
-            elif OS_NAME == "Windows":
-                cmd = ["ping", "-n", str(count), host]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10.0)
-            if result.returncode == 0:
-                latencies = []
-                for line in result.stdout.splitlines():
-                    match = re.search(
-                        r"(\b\w+|[^\x00-\x7F]+)[=<]\s*([\d\.]+)\s*(ms)?",
-                        line,
-                        re.IGNORECASE,
-                    )
-                    if match:
-                        prefix = match.group(1).lower()
-                        if prefix != "ttl":
-                            latencies.append(float(match.group(2)))
-                stats = compute_stats(latencies, "ICMP", total_count=count)
-                if stats:
-                    return stats, True
-        except Exception:
-            pass  # non-fatal: ICMP failed mid-run; falls to TCP
+    probe_cmd = (
+        ["ping", "-c", "1", "-t", "1", host]
+        if OS_NAME == "Darwin"
+        else ["ping", "-c", "1", "-W", "1", host]
+        if OS_NAME == "Linux"
+        else ["ping", "-n", "1", "-w", "1000", host]
+        if OS_NAME == "Windows"
+        else None
+    )
+    if probe_cmd and _cmd(probe_cmd, timeout=2.0) is not None:
+        cmd = (
+            ["ping", "-c", str(count), "-i", "0.1", host]
+            if OS_NAME in ("Darwin", "Linux")
+            else ["ping", "-n", str(count), host]
+            if OS_NAME == "Windows"
+            else []
+        )
+        res = _cmd(cmd, timeout=10.0)
+        if res:
+            latencies = []
+            for line in res.splitlines():
+                match = re.search(
+                    r"(\b\w+|[^\x00-\x7F]+)[=<]\s*([\d\.]+)\s*(ms)?",
+                    line,
+                    re.IGNORECASE,
+                )
+                if match and match.group(1).lower() != "ttl":
+                    latencies.append(float(match.group(2)))
+            stats = compute_stats(latencies, "ICMP", total_count=count)
+            if stats:
+                return stats, True
 
     return test_tcp_latency(host, port=443, count=count), False
 
@@ -710,13 +541,6 @@ async def _async_benchmark_dns(
     return {name: data for name, data in res_list if data is not None}
 
 
-def benchmark_single_resolver(name, ip, test_domains, timeout=0.8):
-    try:
-        return asyncio.run(_async_benchmark_resolver(name, ip, test_domains, timeout))
-    except Exception:
-        return name, None
-
-
 def benchmark_dns(
     interface,
     test_domains=None,
@@ -757,26 +581,22 @@ def benchmark_dns(
 def discover_pmtu(icmp_supported, host="1.1.1.1"):
     if not icmp_supported:
         return None
-    sizes = [1472, 1464, 1452, 1400, 1300, 1200]
-    optimal_payload = None
+    for size in (1472, 1464, 1452, 1400, 1300, 1200):
+        cmd = (
+            ["ping", "-D", "-s", str(size), "-c", "1", "-t", "1", host]
+            if OS_NAME == "Darwin"
+            else ["ping", "-M", "do", "-s", str(size), "-c", "1", "-W", "1", host]
+            if OS_NAME == "Linux"
+            else ["ping", "-f", "-l", str(size), "-n", "1", "-w", "1000", host]
+            if OS_NAME == "Windows"
+            else None
+        )
+        if not cmd:
+            return None
+        res = _cmd(cmd, timeout=2.0)
+        if res and "100%" not in res:
+            return size + 28
 
-    for size in sizes:
-        try:
-            if OS_NAME == "Darwin":
-                cmd = ["ping", "-D", "-s", str(size), "-c", "1", "-t", "1", host]
-            elif OS_NAME == "Linux":
-                cmd = ["ping", "-M", "do", "-s", str(size), "-c", "1", "-W", "1", host]
-            elif OS_NAME == "Windows":
-                cmd = ["ping", "-f", "-l", str(size), "-n", "1", "-w", "1000", host]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0)
-            if result.returncode == 0 and "100%" not in result.stdout:
-                optimal_payload = size
-                break
-        except Exception:
-            pass  # non-fatal: this payload size failed or fragmented; try next size
-
-    if optimal_payload is not None:
-        return optimal_payload + 28
     return None
 
 
@@ -930,6 +750,9 @@ def apply_mtu(interface, mtu_size):
     elif OS_NAME == "Linux":
         cmd = ["sudo", "ip", "link", "set", "dev", interface, "mtu", str(mtu_size)]
     elif OS_NAME == "Windows":
+        if not is_admin():
+            _warn("Elevation required to set MTU on Windows.")
+            return False
         cmd = [
             "netsh",
             "interface",
@@ -940,43 +763,26 @@ def apply_mtu(interface, mtu_size):
             f"mtu={mtu_size}",
             "store=persistent",
         ]
-        if not is_admin():
-            _warn("Elevation required to set MTU on Windows.")
-            return False
     else:
         return False
 
-    try:
-        subprocess.run(cmd, check=True)
+    if _run_ok(cmd, capture_output=False):
         return True
-    except subprocess.CalledProcessError as e:
-        _warn(f"Failed to apply MTU configuration: {e}")
-        return False
+    _warn("Failed to apply MTU configuration.")
+    return False
 
 
 def flush_dns_cache():
     if OS_NAME == "Darwin":
-        try:
-            subprocess.run(["sudo", "dscacheutil", "-flushcache"], check=True)
-            subprocess.run(["sudo", "killall", "-HUP", "mDNSResponder"], check=True)
-        except Exception:
+        if not (_run_ok(["sudo", "dscacheutil", "-flushcache"], capture_output=False) and _run_ok(["sudo", "killall", "-HUP", "mDNSResponder"], capture_output=False)):
             _warn("DNS cache flush failed (dscacheutil/mDNSResponder).")
     elif OS_NAME == "Linux":
-        try:
-            subprocess.run(["sudo", "resolvectl", "flush-caches"], check=True)
-        except Exception:
-            try:
-                subprocess.run(
-                    ["sudo", "systemd-resolve", "--flush-caches"], check=True
-                )
-            except Exception:
-                _warn(
-                    "DNS cache flush failed (resolvectl and systemd-resolve both unavailable)."
-                )
+        if not (_run_ok(["sudo", "resolvectl", "flush-caches"], capture_output=False) or _run_ok(["sudo", "systemd-resolve", "--flush-caches"], capture_output=False)):
+            _warn(
+                "DNS cache flush failed (resolvectl and systemd-resolve both unavailable)."
+            )
     elif OS_NAME == "Windows":
-        try:
-            subprocess.run(["ipconfig", "/flushdns"], check=True)
-        except Exception:
+        if not _run_ok(["ipconfig", "/flushdns"], capture_output=False):
             _warn("DNS cache flush failed (ipconfig /flushdns).")
 
 
@@ -1011,30 +817,18 @@ def _persist_sysctl_dict(kv_dict: dict[str, str]) -> None:
         "    lines.append(f'{k}={v}\\n')\n"
         "open(path, 'w').writelines(lines)\n"
     )
-    try:
-        result = subprocess.run(
-            ["sudo", "python3", "-c", script], capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            print(f"    Warning: Could not persist sysctl to {conf_path}")
-    except Exception as e:
-        print(f"    Warning: Could not persist sysctl: {e}")
-
-
-def _persist_sysctl(key, val):
-    _persist_sysctl_dict({key: val})
+    if not _run_ok(["sudo", "python3", "-c", script]):
+        print(f"    Warning: Could not persist sysctl to {conf_path}")
 
 
 def _apply_sysctl_dict(optimizations: dict[str, str]) -> None:
     _persist_sysctl_dict(optimizations)
     if OS_NAME in ("Darwin", "Linux") or is_bsd():
-        try:
-            cmd = ["sudo", "sysctl", "-w"] + [
-                f"{k}={v}" for k, v in optimizations.items()
-            ]
-            subprocess.run(cmd, check=True, capture_output=True)
-        except Exception as e:
-            _warn(f"Failed to apply sysctl batch: {e}")
+        cmd = ["sudo", "sysctl", "-w"] + [
+            f"{k}={v}" for k, v in optimizations.items()
+        ]
+        if not _run_ok(cmd):
+            _warn("Failed to apply sysctl batch.")
 
 
 def _revert_sysctl(backup: dict | None, default_sysctl: dict[str, str]) -> None:
@@ -1044,15 +838,10 @@ def _revert_sysctl(backup: dict | None, default_sysctl: dict[str, str]) -> None:
     for key, val in default_sysctl.items():
         backup_val = sysctl_values.get(key)
         target_val = backup_val or val
-        try:
-            subprocess.run(
-                ["sudo", "sysctl", "-w", f"{key}={target_val}"],
-                check=True,
-                capture_output=True,
-            )
-            _persist_sysctl(key, target_val)
-        except Exception as e:
-            _warn(f"Failed to revert sysctl {key}: {e}")
+        if _run_ok(["sudo", "sysctl", "-w", f"{key}={target_val}"]):
+            _persist_sysctl_dict({key: target_val})
+        else:
+            _warn(f"Failed to revert sysctl {key}.")
 
 
 def apply_sysctl_optimizations(gaming=False):
@@ -1070,90 +859,57 @@ def apply_sysctl_optimizations(gaming=False):
             _warn("Elevation required to tune TCP/IP parameters on Windows.")
             return
         for key, val in _WINDOWS_TCP_DEFAULTS.items():
-            try:
-                subprocess.run(
-                    ["netsh", "int", "tcp", "set", "global", f"{key}={val}"],
-                    check=True,
-                    capture_output=True,
-                )
-            except Exception as e:
-                _warn(f"Failed to apply {key}: {e}")
+            if not _run_ok(["netsh", "int", "tcp", "set", "global", f"{key}={val}"]):
+                _warn(f"Failed to apply {key}.")
 
 
 def apply_power_save_optimization(interface: str, gaming: bool = False) -> bool:
     if OS_NAME == "Darwin":
-        if not gaming:
-            return False
-        try:
-            subprocess.run(
-                ["sudo", "pmset", "-a", "sleep", "0"],
-                check=True,
-                capture_output=True,
-            )
+        if gaming and _run_ok(["sudo", "pmset", "-a", "sleep", "0"]):
             return True
-        except Exception as e:
-            _warn(f"Failed to disable system sleep on macOS: {e}")
-            return False
+        return False
     elif OS_NAME == "Linux":
-        try:
-            subprocess.run(
-                ["sudo", "iw", "dev", interface, "set", "power_save", "off"],
-                check=True,
-                capture_output=True,
-            )
+        if _run_ok(["sudo", "iw", "dev", interface, "set", "power_save", "off"]):
             print("    Wi-Fi power saving disabled.")
             return True
-        except Exception as e:
-            _warn(f"Failed to disable Wi-Fi power saving on Linux: {e}")
+        _warn("Failed to disable Wi-Fi power saving on Linux.")
     elif OS_NAME == "Windows":
         if not is_admin():
             _warn("Elevation required to disable Wi-Fi power management on Windows.")
             return False
-        try:
-            ps_iface = interface.replace("'", "''")
-            cmd = [
-                "powershell",
-                "-Command",
-                f"Set-NetAdapterPowerManagement -Name '{ps_iface}' -AllowComputerToTurnOffDevice $false",
-            ]
-            subprocess.run(cmd, check=True, capture_output=True)
+        ps_iface = interface.replace("'", "''")
+        cmd = [
+            "powershell",
+            "-Command",
+            f"Set-NetAdapterPowerManagement -Name '{ps_iface}' -AllowComputerToTurnOffDevice $false",
+        ]
+        if _run_ok(cmd):
             print("    Wi-Fi adapter power management disabled.")
             return True
-        except Exception as e:
-            _warn(f"Failed to disable Wi-Fi power management on Windows: {e}")
+        _warn("Failed to disable Wi-Fi power management on Windows.")
     return False
 
 
 def get_windows_roaming_aggressiveness(interface: str) -> str | None:
-    try:
-        ps_iface = interface.replace("'", "''")
-        cmd = [
-            "powershell",
-            "-Command",
-            f"(Get-NetAdapterAdvancedProperty -Name '{ps_iface}' -RegistryKeyword 'RoamingSensitivityLevel').RegistryValue",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
+    ps_iface = interface.replace("'", "''")
+    cmd = [
+        "powershell",
+        "-Command",
+        f"(Get-NetAdapterAdvancedProperty -Name '{ps_iface}' -RegistryKeyword 'RoamingSensitivityLevel').RegistryValue",
+    ]
+    res = _cmd(cmd)
+    return res.strip() if res and res.strip() else None
 
 
 def set_windows_roaming_aggressiveness(interface: str, value: str) -> bool:
-    try:
-        ps_iface = interface.replace("'", "''")
-        ps_val = value.replace("'", "''")
-        cmd = [
-            "powershell",
-            "-Command",
-            f"Set-NetAdapterAdvancedProperty -Name '{ps_iface}' -RegistryKeyword 'RoamingSensitivityLevel' -RegistryValue '{ps_val}'",
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        return True
-    except Exception:
-        pass
-    return False
+    ps_iface = interface.replace("'", "''")
+    ps_val = value.replace("'", "''")
+    cmd = [
+        "powershell",
+        "-Command",
+        f"Set-NetAdapterAdvancedProperty -Name '{ps_iface}' -RegistryKeyword 'RoamingSensitivityLevel' -RegistryValue '{ps_val}'",
+    ]
+    return _run_ok(cmd)
 
 
 def _get_backup_path() -> str:
@@ -1177,75 +933,50 @@ BACKUP_PATH = _get_backup_path()
 
 def get_current_mtu(interface):
     if OS_NAME == "Darwin" or is_bsd():
-        try:
-            result = subprocess.run(
-                ["ifconfig", interface], capture_output=True, text=True
-            )
-            match = re.search(r"mtu\s+(\d+)", result.stdout)
-            if match:
-                return int(match.group(1))
-        except Exception:
-            pass
+        out = _cmd(["ifconfig", interface])
     elif OS_NAME == "Linux":
-        try:
-            result = subprocess.run(
-                ["ip", "link", "show", interface], capture_output=True, text=True
-            )
-            match = re.search(r"mtu\s+(\d+)", result.stdout)
-            if match:
-                return int(match.group(1))
-        except Exception:
-            pass
+        out = _cmd(["ip", "link", "show", interface])
     elif OS_NAME == "Windows":
-        try:
-            result = subprocess.run(
-                ["netsh", "interface", "ipv4", "show", "subinterfaces"],
-                capture_output=True,
-                text=True,
-            )
-            for line in result.stdout.splitlines():
+        out = _cmd(["netsh", "interface", "ipv4", "show", "subinterfaces"])
+        if out:
+            for line in out.splitlines():
                 if interface in line:
                     parts = line.split()
                     if parts and parts[0].isdigit():
                         return int(parts[0])
-        except Exception:
-            pass
+        return 1500
+    else:
+        return 1500
+
+    if out:
+        match = re.search(r"mtu\s+(\d+)", out)
+        if match:
+            return int(match.group(1))
     return 1500
 
 
 def get_sysctl_value(key):
-    try:
-        result = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True)
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
+    res = _cmd(["sysctl", "-n", key])
+    return res.strip() if res else None
 
 
 def get_windows_tcp_settings():
     settings = {}
-    try:
-        result = subprocess.run(
-            ["netsh", "interface", "tcp", "show", "global"],
-            capture_output=True,
-            text=True,
-        )
-        for line in result.stdout.splitlines():
+    res = _cmd(["netsh", "interface", "tcp", "show", "global"])
+    if res:
+        for line in res.splitlines():
             if ":" in line:
                 key, val = line.split(":", 1)
-                key = key.strip().lower()
-                val = val.strip().lower()
-                if "receive-side scaling" in key or "rss" in key:
-                    settings["rss"] = val
-                elif "auto-tuning level" in key:
-                    settings["autotuninglevel"] = val
-                elif "fast open" in key and "fallback" not in key:
-                    settings["fastopen"] = val
-                elif "ecn capability" in key:
-                    settings["ecncapability"] = val
-    except Exception:
-        pass
+                k = key.strip().lower()
+                v = val.strip().lower()
+                if "receive-side scaling" in k or "rss" in k:
+                    settings["rss"] = v
+                elif "auto-tuning level" in k:
+                    settings["autotuninglevel"] = v
+                elif "fast open" in k and "fallback" not in k:
+                    settings["fastopen"] = v
+                elif "ecn capability" in k:
+                    settings["ecncapability"] = v
     return settings
 
 
@@ -1543,14 +1274,7 @@ def main():
 
     # Start non-privileged background diagnostics BEFORE sudo prompt so they execute
     # in parallel while the user types their password.
-    test_domains_list = [d.strip() for d in args.domains.split(",") if d.strip()]
-    if not test_domains_list:
-        test_domains_list = [
-            "google.com",
-            "cloudflare.com",
-            "github.com",
-            "wikipedia.org",
-        ]
+    test_domains_list = [d.strip() for d in args.domains.split(",") if d.strip()] or None
 
     diag_executor = ThreadPoolExecutor(max_workers=4)
     wifi_future = diag_executor.submit(get_current_wifi_details, interface)

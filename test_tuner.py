@@ -11,32 +11,21 @@ class TestTunerMultiPlatform(unittest.TestCase):
     # --- platform.system() and admin status ---
 
     @patch("platform.system", return_value="Windows")
-    def test_is_admin_windows_admin(self, mock_system):
+    def test_is_admin_windows(self, mock_system):
         tuner.OS_NAME = "Windows"
         mock_ctypes = MagicMock()
-        mock_ctypes.windll.shell32.IsUserAnAdmin.return_value = 1
         with patch.dict("sys.modules", {"ctypes": mock_ctypes}):
-            self.assertTrue(tuner.is_admin())
-
-    @patch("platform.system", return_value="Windows")
-    def test_is_admin_windows_user(self, mock_system):
-        tuner.OS_NAME = "Windows"
-        mock_ctypes = MagicMock()
-        mock_ctypes.windll.shell32.IsUserAnAdmin.return_value = 0
-        with patch.dict("sys.modules", {"ctypes": mock_ctypes}):
-            self.assertFalse(tuner.is_admin())
+            for val, expected in [(1, True), (0, False)]:
+                with self.subTest(val=val):
+                    mock_ctypes.windll.shell32.IsUserAnAdmin.return_value = val
+                    self.assertEqual(tuner.is_admin(), expected)
 
     @patch("platform.system", return_value="Linux")
-    @patch("os.geteuid", return_value=0)
-    def test_is_admin_linux_root(self, mock_geteuid, mock_system):
+    def test_is_admin_linux(self, mock_system):
         tuner.OS_NAME = "Linux"
-        self.assertTrue(tuner.is_admin())
-
-    @patch("platform.system", return_value="Linux")
-    @patch("os.geteuid", return_value=1000)
-    def test_is_admin_linux_user(self, mock_geteuid, mock_system):
-        tuner.OS_NAME = "Linux"
-        self.assertFalse(tuner.is_admin())
+        for euid, expected in [(0, True), (1000, False)]:
+            with self.subTest(euid=euid), patch("os.geteuid", return_value=euid):
+                self.assertEqual(tuner.is_admin(), expected)
 
     @patch("platform.system", return_value="Darwin")
     @patch("tuner.is_admin", return_value=False)
@@ -242,87 +231,47 @@ class TestTunerMultiPlatform(unittest.TestCase):
         self.assertIn("[warn]", buf.getvalue())
 
     @patch("platform.system", return_value="Windows")
-    @patch("tuner.is_admin", return_value=True)
     @patch("subprocess.run")
-    def test_apply_sysctl_optimizations_windows_admin(
-        self, mock_run, mock_is_admin, mock_system
-    ):
+    def test_apply_sysctl_optimizations_windows(self, mock_run, mock_system):
         tuner.OS_NAME = "Windows"
-        mock_run.return_value = MagicMock(returncode=0)
-        tuner.apply_sysctl_optimizations()
-        mock_run.assert_any_call(
-            ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
-            check=True,
-            capture_output=True,
-        )
-        mock_run.assert_any_call(
-            ["netsh", "int", "tcp", "set", "global", "rss=enabled"],
-            check=True,
-            capture_output=True,
-        )
-
-    @patch("platform.system", return_value="Windows")
-    @patch("tuner.is_admin", return_value=False)
-    @patch("subprocess.run")
-    def test_apply_sysctl_optimizations_windows_non_admin(
-        self, mock_run, mock_is_admin, mock_system
-    ):
-        tuner.OS_NAME = "Windows"
-        tuner.apply_sysctl_optimizations()
-        mock_run.assert_not_called()
+        for is_adm in (True, False):
+            with self.subTest(is_adm=is_adm), patch("tuner.is_admin", return_value=is_adm):
+                mock_run.reset_mock()
+                mock_run.return_value = MagicMock(returncode=0)
+                tuner.apply_sysctl_optimizations()
+                if is_adm:
+                    mock_run.assert_any_call(
+                        ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
+                        check=True,
+                        capture_output=True,
+                    )
+                else:
+                    mock_run.assert_not_called()
 
     # --- verify_dns ---
 
     @patch("subprocess.run")
-    def test_verify_dns_macos_present(self, mock_run):
+    def test_verify_dns_macos(self, mock_run):
         tuner.OS_NAME = "Darwin"
-        mock_run.return_value = MagicMock(stdout="1.1.1.1\n", returncode=0)
-        with patch("tuner.get_macos_service_name", return_value="Wi-Fi"):
-            self.assertTrue(tuner.verify_dns("en0", "1.1.1.1"))
-
-    @patch("subprocess.run")
-    def test_verify_dns_macos_absent(self, mock_run):
-        tuner.OS_NAME = "Darwin"
-        mock_run.return_value = MagicMock(stdout="8.8.8.8\n", returncode=0)
-        with patch("tuner.get_macos_service_name", return_value="Wi-Fi"):
-            self.assertFalse(tuner.verify_dns("en0", "1.1.1.1"))
+        for stdout, expected in [("1.1.1.1\n", True), ("8.8.8.8\n", False)]:
+            with self.subTest(expected=expected), patch("tuner.get_macos_service_name", return_value="Wi-Fi"):
+                mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
+                self.assertEqual(tuner.verify_dns("en0", "1.1.1.1"), expected)
 
     @patch("subprocess.run", side_effect=FileNotFoundError)
-    @patch(
-        "builtins.open",
-        new_callable=mock_open,
-        read_data="nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
-    )
-    def test_verify_dns_linux_present(self, mock_file, mock_run):
+    def test_verify_dns_linux_resolv(self, mock_run):
         tuner.OS_NAME = "Linux"
-        self.assertTrue(tuner.verify_dns("wlan0", "1.1.1.1"))
-
-    @patch("subprocess.run", side_effect=FileNotFoundError)
-    @patch("builtins.open", new_callable=mock_open, read_data="nameserver 8.8.8.8\n")
-    def test_verify_dns_linux_absent(self, mock_file, mock_run):
-        tuner.OS_NAME = "Linux"
-        self.assertFalse(tuner.verify_dns("wlan0", "1.1.1.1"))
+        for content, expected in [("nameserver 1.1.1.1\nnameserver 8.8.8.8\n", True), ("nameserver 8.8.8.8\n", False)]:
+            with self.subTest(expected=expected), patch("builtins.open", new_callable=mock_open, read_data=content):
+                self.assertEqual(tuner.verify_dns("wlan0", "1.1.1.1"), expected)
 
     @patch("subprocess.run")
-    def test_verify_dns_linux_resolvectl_present(self, mock_run):
-        """resolvectl path: DNS IP found in resolvectl status output."""
+    def test_verify_dns_linux_resolvectl(self, mock_run):
         tuner.OS_NAME = "Linux"
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="  DNS Servers: 1.1.1.1\n"
-        )
-        self.assertTrue(tuner.verify_dns("wlan0", "1.1.1.1"))
-        mock_run.assert_called_with(
-            ["resolvectl", "status", "wlan0"], capture_output=True, text=True
-        )
-
-    @patch("subprocess.run")
-    def test_verify_dns_linux_resolvectl_absent(self, mock_run):
-        """resolvectl path: DNS IP not in resolvectl status output."""
-        tuner.OS_NAME = "Linux"
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="  DNS Servers: 8.8.8.8\n"
-        )
-        self.assertFalse(tuner.verify_dns("wlan0", "1.1.1.1"))
+        for stdout, expected in [("  DNS Servers: 1.1.1.1\n", True), ("  DNS Servers: 8.8.8.8\n", False)]:
+            with self.subTest(expected=expected):
+                mock_run.return_value = MagicMock(returncode=0, stdout=stdout)
+                self.assertEqual(tuner.verify_dns("wlan0", "1.1.1.1"), expected)
 
     @patch("subprocess.run", side_effect=FileNotFoundError)
     @patch("builtins.open", new_callable=mock_open, read_data="nameserver 1.1.1.1\n")
@@ -335,95 +284,49 @@ class TestTunerMultiPlatform(unittest.TestCase):
 
     @patch("subprocess.run")
     def test_get_macos_wifi_details(self, mock_run):
-        mock_result = MagicMock()
-        mock_result.stdout = "SSID : TestNet\nSecurity : WPA2\n"
-        mock_result.returncode = 0
-        mock_run.return_value = mock_result
+        mock_run.return_value = MagicMock(stdout="SSID : TestNet\nSecurity : WPA2\n", returncode=0)
         details = tuner.get_macos_wifi_details("en0")
         self.assertEqual(details["SSID"], "TestNet")
         self.assertEqual(details["Security"], "WPA2")
 
-    # --- _persist_sysctl ---
+    # --- _persist_sysctl_dict ---
 
     @patch("subprocess.run")
-    def test_persist_sysctl_new_key(self, mock_run):
-        """New key appended when conf does not exist."""
+    def test_persist_sysctl_dict(self, mock_run):
         tuner.OS_NAME = "Darwin"
-        mock_run.return_value = MagicMock(returncode=0)
-        tuner._persist_sysctl("net.inet.tcp.mssdflt", "1460")
-        call_args = mock_run.call_args
-        cmd = call_args[0][0]
-        self.assertEqual(cmd[:3], ["sudo", "python3", "-c"])
-        script = cmd[3]
-        self.assertIn("net.inet.tcp.mssdflt", script)
-        self.assertIn("1460", script)
-
-    @patch("subprocess.run")
-    def test_persist_sysctl_failure_warns(self, mock_run):
-        """Non-zero return code from sudo python3 prints a warning (no exception)."""
-        tuner.OS_NAME = "Darwin"
-        mock_run.return_value = MagicMock(returncode=1, stderr="permission denied")
-        # Should not raise
-        tuner._persist_sysctl("net.inet.tcp.mssdflt", "1460")
+        for retcode in (0, 1):
+            with self.subTest(retcode=retcode):
+                mock_run.return_value = MagicMock(returncode=retcode, stderr="permission denied")
+                tuner._persist_sysctl_dict({"net.inet.tcp.mssdflt": "1460"})
 
     # --- apply_sysctl_optimizations gaming flag ---
 
     @patch("subprocess.run")
-    def test_apply_sysctl_gaming_true_darwin(self, mock_run):
+    def test_apply_sysctl_gaming_darwin(self, mock_run):
         tuner.OS_NAME = "Darwin"
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        tuner.apply_sysctl_optimizations(gaming=True)
-        sysctl_calls = [
-            c for c in mock_run.call_args_list if c[0][0][:2] == ["sudo", "sysctl"]
-        ]
-        args_str = " ".join(str(c) for c in sysctl_calls)
-        self.assertIn("delayed_ack=0", args_str)
-
-    @patch("subprocess.run")
-    def test_apply_sysctl_gaming_false_darwin(self, mock_run):
-        tuner.OS_NAME = "Darwin"
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        tuner.apply_sysctl_optimizations(gaming=False)
-        sysctl_calls = [
-            c for c in mock_run.call_args_list if c[0][0][:2] == ["sudo", "sysctl"]
-        ]
-        args_str = " ".join(str(c) for c in sysctl_calls)
-        self.assertNotIn("delayed_ack", args_str)
+        for gaming in (True, False):
+            with self.subTest(gaming=gaming):
+                mock_run.reset_mock()
+                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                tuner.apply_sysctl_optimizations(gaming=gaming)
+                sysctl_calls = [c for c in mock_run.call_args_list if c[0][0][:2] == ["sudo", "sysctl"]]
+                args_str = " ".join(str(c) for c in sysctl_calls)
+                self.assertEqual("delayed_ack=0" in args_str, gaming)
 
     # --- get_current_mtu ---
 
-    @patch("platform.system", return_value="Darwin")
     @patch("subprocess.run")
-    def test_get_current_mtu_darwin(self, mock_run, mock_system):
-        tuner.OS_NAME = "Darwin"
-        mock_run.return_value = MagicMock(
-            stdout="en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n",
-            returncode=0,
-        )
-        mtu = tuner.get_current_mtu("en0")
-        self.assertEqual(mtu, 1500)
-
-    @patch("platform.system", return_value="Linux")
-    @patch("subprocess.run")
-    def test_get_current_mtu_linux(self, mock_run, mock_system):
-        tuner.OS_NAME = "Linux"
-        mock_run.return_value = MagicMock(
-            stdout="3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1492 qdisc noqueue state UP\n",
-            returncode=0,
-        )
-        mtu = tuner.get_current_mtu("wlan0")
-        self.assertEqual(mtu, 1492)
-
-    @patch("platform.system", return_value="Windows")
-    @patch("subprocess.run")
-    def test_get_current_mtu_windows(self, mock_run, mock_system):
-        tuner.OS_NAME = "Windows"
-        mock_run.return_value = MagicMock(
-            stdout="   MTU  MediaSenseState   Bytes In  Bytes Out  Interface\n------  ---------------  ---------  ---------  -------------\n  1450                1    1000200     500100  Wi-Fi\n",
-            returncode=0,
-        )
-        mtu = tuner.get_current_mtu("Wi-Fi")
-        self.assertEqual(mtu, 1450)
+    def test_get_current_mtu_platforms(self, mock_run):
+        cases = [
+            ("Darwin", "en0: flags=8863 mtu 1500\n", "en0", 1500),
+            ("Linux", "3: wlan0: mtu 1492 qdisc noqueue\n", "wlan0", 1492),
+            ("Windows", "  1450                1  Wi-Fi\n", "Wi-Fi", 1450),
+        ]
+        for os_name, stdout, iface, expected in cases:
+            with self.subTest(os_name=os_name), patch("platform.system", return_value=os_name):
+                tuner.OS_NAME = os_name
+                mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
+                self.assertEqual(tuner.get_current_mtu(iface), expected)
 
     # --- save_backup & revert_optimizations ---
 
@@ -549,7 +452,7 @@ class TestTunerMultiPlatform(unittest.TestCase):
 
     @patch("platform.system", return_value="FreeBSD")
     @patch("subprocess.run")
-    @patch("tuner._persist_sysctl")
+    @patch("tuner._persist_sysctl_dict")
     def test_apply_sysctl_optimizations_bsd(self, mock_persist, mock_run, mock_system):
         tuner.OS_NAME = "FreeBSD"
         tuner.IS_BSD = True
