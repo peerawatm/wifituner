@@ -1,31 +1,95 @@
 #!/usr/bin/env python3
 __version__ = "1.1.0"
-import os
 import argparse
+import asyncio
+import contextlib
 import functools
 import json
+import os
 import platform
-import subprocess
-import time
+import random
 import re
 import socket
-import random
+import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 # Check platform
 OS_NAME = platform.system()
+_AIRPORT_LOCK = threading.Lock()
 
 
-def is_bsd():
+def is_bsd() -> bool:
     return OS_NAME.endswith("BSD") or "BSD" in OS_NAME
 
 
-# Band-keyed neighbor channel counts. Populated by bg_scan_channels() at runtime.
-neighbor_channels: dict[str, dict[str, int]] = {"2GHz": {}, "5GHz": {}, "6GHz": {}}
+with contextlib.suppress(ImportError):
+    import uvloop  # type: ignore[import-not-found]
+
+    uvloop.install()
 
 
-def _warn(msg):
+def _is_linux_or_bsd() -> bool:
+    return OS_NAME == "Linux" or is_bsd()
+
+
+_IP_RE = re.compile(
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b|(?:::[0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}:[0-9a-fA-F:]+)"
+)
+
+_MACOS_SYSCTL_DEFAULTS = {
+    "net.inet.tcp.mssdflt": "512",
+    "net.inet.tcp.v6mssdflt": "1024",
+    "net.inet.tcp.win_scale_factor": "3",
+    "net.inet.tcp.delayed_ack": "3",
+    "net.inet.tcp.sendspace": "524288",
+    "net.inet.tcp.recvspace": "524288",
+    "net.inet.tcp.fastopen": "3",
+    "net.inet.tcp.always_keepalive": "0",
+    "net.inet.tcp.keepidle": "7200000",
+    "net.inet.tcp.keepintvl": "75000",
+}
+
+_MACOS_SYSCTL_OPTIMIZATIONS = {
+    "net.inet.tcp.mssdflt": "1460",
+    "net.inet.tcp.v6mssdflt": "1440",
+    "net.inet.tcp.win_scale_factor": "8",
+    "net.inet.tcp.sendspace": "1048576",
+    "net.inet.tcp.recvspace": "1048576",
+    "net.inet.tcp.fastopen": "3",
+    "net.inet.tcp.always_keepalive": "1",
+    "net.inet.tcp.keepidle": "30000",
+    "net.inet.tcp.keepintvl": "5000",
+}
+
+_LINUX_SYSCTL_DEFAULTS = {
+    "net.ipv4.tcp_slow_start_after_idle": "1",
+    "net.ipv4.tcp_notsent_lowat": "4294967295",
+}
+
+_LINUX_SYSCTL_OPTIMIZATIONS = {
+    "net.ipv4.tcp_slow_start_after_idle": "0",
+    "net.ipv4.tcp_notsent_lowat": "16384",
+}
+
+_BSD_SYSCTL_DEFAULTS = {
+    "net.inet.tcp.mssdflt": "512",
+}
+
+_BSD_SYSCTL_OPTIMIZATIONS = {
+    "net.inet.tcp.mssdflt": "1460",
+}
+
+_WINDOWS_TCP_DEFAULTS = {
+    "autotuninglevel": "normal",
+    "rss": "enabled",
+    "fastopen": "enabled",
+    "ecncapability": "enabled",
+}
+
+
+def _warn(msg: str) -> None:
     """Print a non-fatal warning to stdout."""
     print(f"    [warn] {msg}")
 
@@ -36,10 +100,24 @@ def is_admin():
             import ctypes
 
             return ctypes.windll.shell32.IsUserAnAdmin() != 0  # type: ignore[attr-defined]
-        else:
-            return os.geteuid() == 0
+        return os.geteuid() == 0
     except Exception:
         return False
+
+
+def ensure_admin() -> None:
+    """Prompt for admin credentials at startup so mid-run sudo calls do not block on password."""
+    if not is_admin():
+        if OS_NAME == "Windows":
+            _warn(
+                "Elevation required for full network tuning. Run in Administrator terminal."
+            )
+        else:
+            try:
+                print("Authenticating administrator privileges...")
+                subprocess.run(["sudo", "-v"], check=True)
+            except Exception:
+                _warn("Failed to obtain root privileges via sudo.")
 
 
 def get_wifi_interface():
@@ -60,19 +138,8 @@ def get_wifi_interface():
         except Exception:
             pass  # non-fatal: returns "en0" as default
         return "en0"
-    elif is_bsd():
+    if is_bsd():
         try:
-            result = subprocess.run(
-                ["sysctl", "-n", "net.wlan.devices"], capture_output=True, text=True
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                ifconfig_res = subprocess.run(
-                    ["ifconfig", "-l"], capture_output=True, text=True
-                )
-                if ifconfig_res.returncode == 0:
-                    for part in ifconfig_res.stdout.split():
-                        if part.startswith("wlan"):
-                            return part
             ifconfig_res = subprocess.run(
                 ["ifconfig", "-l"], capture_output=True, text=True
             )
@@ -101,10 +168,10 @@ def get_wifi_interface():
         except Exception:
             pass
         return "wlan0"
-    elif OS_NAME == "Linux":
+    if OS_NAME == "Linux":
         try:
             if os.path.exists("/proc/net/wireless"):
-                with open("/proc/net/wireless", "r") as f:
+                with open("/proc/net/wireless") as f:
                     lines = f.readlines()
                     for line in lines[2:]:
                         parts = line.split()
@@ -118,7 +185,7 @@ def get_wifi_interface():
         except Exception:
             pass  # non-fatal: returns "wlan0" as default
         return "wlan0"
-    elif OS_NAME == "Windows":
+    if OS_NAME == "Windows":
         try:
             result = subprocess.run(
                 ["netsh", "wlan", "show", "interfaces"],
@@ -137,7 +204,7 @@ def get_wifi_interface():
     return "wlan0"
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def get_macos_service_name(interface):
     try:
         result = subprocess.run(
@@ -157,65 +224,55 @@ def get_macos_service_name(interface):
     return "Wi-Fi"
 
 
-@functools.lru_cache(maxsize=None)
-def _get_airport_json():
-    """Invoke system_profiler SPAirPortDataType -json once per process; cache result."""
-    try:
-        result = subprocess.run(
-            ["system_profiler", "SPAirPortDataType", "-json"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout)
-    except Exception:
-        pass  # non-fatal: returns {} → triggers slow-path fallback in caller
-    return {}
-
-
-# Use system_profiler SPAirPortDataType -json (macOS 12+, structured output).
-# airport -I was removed in macOS 15 (Sequoia); this is the stable replacement.
-def get_macos_wifi_details():
+def get_macos_wifi_details(interface="en0"):
     details = {}
     try:
-        data = _get_airport_json()
-        if data:
-            interfaces = data.get("SPAirPortDataType", [{}])[0].get(
-                "spairport_airport_interfaces", []
-            )
-            for iface in interfaces:
-                current = iface.get("spairport_current_network_information", {})
-                if not current:
-                    continue
-                if "_name" in current:
-                    details["SSID"] = current["_name"]
-                if "spairport_network_channel" in current:
-                    details["Channel"] = current["spairport_network_channel"]
-                if "spairport_network_phymode" in current:
-                    details["PHY Mode"] = current["spairport_network_phymode"]
-                if "spairport_signal_noise" in current:
-                    details["Signal / Noise"] = current["spairport_signal_noise"]
-                    match = re.search(
-                        r"(-?\d+)\s*dBm\s*/\s*(-?\d+)\s*dBm",
-                        str(current["spairport_signal_noise"]),
-                    )
-                    if match:
-                        details["RSSI"] = f"{match.group(1)} dBm"
-                        details["Noise"] = f"{match.group(2)} dBm"
-                        details["SNR"] = (
-                            f"{int(match.group(1)) - int(match.group(2))} dB"
-                        )
-                if "spairport_security_mode" in current:
-                    details["Security"] = current["spairport_security_mode"]
-                if "spairport_network_rate" in current:
-                    details["Transmit Rate"] = (
-                        f"{current['spairport_network_rate']} Mbps"
-                    )
-                if details:
-                    break
+        res = subprocess.run(
+            ["ipconfig", "getsummary", interface],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line_str = line.strip()
+                if line_str.startswith("SSID :"):
+                    details["SSID"] = line_str.split(":", 1)[1].strip()
+                elif line_str.startswith("Security :"):
+                    details["Security"] = line_str.split(":", 1)[1].strip()
+                elif line_str.startswith("Router :"):
+                    details["Gateway"] = line_str.split(":", 1)[1].strip()
     except Exception:
-        pass  # non-fatal: slow path called in return statement below
-    return details if details else _get_macos_wifi_details_slow()
+        pass
+
+    try:
+        ip_res = subprocess.run(
+            ["ipconfig", "getifaddr", interface],
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+        )
+        if ip_res.returncode == 0 and ip_res.stdout.strip():
+            details["IP Address"] = ip_res.stdout.strip()
+    except Exception:
+        pass
+
+    if not details.get("SSID"):
+        try:
+            res = subprocess.run(
+                ["networksetup", "-getairportnetwork", interface],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+            if res.returncode == 0 and "Current Wi-Fi Network:" in res.stdout:
+                details["SSID"] = res.stdout.split("Current Wi-Fi Network:", 1)[
+                    1
+                ].strip()
+        except Exception:
+            pass
+
+    return details
 
 
 def _get_macos_wifi_details_slow():
@@ -404,12 +461,12 @@ def get_bsd_wifi_details(interface: str) -> dict[str, str]:
 
 def get_current_wifi_details(interface):
     if OS_NAME == "Darwin":
-        return get_macos_wifi_details()
-    elif OS_NAME == "Windows":
+        return get_macos_wifi_details(interface)
+    if OS_NAME == "Windows":
         return get_windows_wifi_details()
-    elif OS_NAME == "Linux":
+    if OS_NAME == "Linux":
         return get_linux_wifi_details(interface)
-    elif is_bsd():
+    if is_bsd():
         return get_bsd_wifi_details(interface)
     return {}
 
@@ -435,10 +492,10 @@ def get_dns_servers(interface):
         except Exception as e:
             _warn(f"networksetup -getdnsservers failed: {e}")
         return []
-    elif OS_NAME == "Linux" or is_bsd():
+    if _is_linux_or_bsd():
         dns = []
         try:
-            with open("/etc/resolv.conf", "r") as f:
+            with open("/etc/resolv.conf") as f:
                 for line in f:
                     if line.startswith("nameserver"):
                         parts = line.split()
@@ -447,9 +504,9 @@ def get_dns_servers(interface):
         except Exception as e:
             _warn(f"/etc/resolv.conf read failed: {e}")
         return dns
-    elif OS_NAME == "Windows":
+    if OS_NAME == "Windows":
         dns = []
-        for family_cmd in ["ipv4", "ipv6"]:
+        for family_cmd in ("ipv4", "ipv6"):
             try:
                 result = subprocess.run(
                     [
@@ -463,18 +520,15 @@ def get_dns_servers(interface):
                     capture_output=True,
                     text=True,
                 )
-                ip_pattern = re.compile(
-                    r"\b(?:\d{1,3}\.){3}\d{1,3}\b|(?:::[0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}:[0-9a-fA-F:]+)"
-                )
                 for line in result.stdout.splitlines():
                     line_lower = line.lower()
                     if (
                         "dns" in line_lower
                         or "configured" in line_lower
                         or "statically" in line_lower
-                        or ip_pattern.search(line)
+                        or _IP_RE.search(line)
                     ):
-                        ips = ip_pattern.findall(line)
+                        ips = _IP_RE.findall(line)
                         dns.extend(ips)
             except Exception as e:
                 _warn(f"netsh interface {family_cmd} show dns failed: {e}")
@@ -505,7 +559,7 @@ def test_tcp_latency(host="1.1.1.1", port=443, count=5):
     return compute_stats(latencies, "TCP (Port 443)")
 
 
-def test_latency(host="1.1.1.1", count=5):
+def test_latency(host="1.1.1.1", count=2):
     icmp_supported = False
     try:
         if OS_NAME in ("Darwin", "Linux"):
@@ -532,7 +586,7 @@ def test_latency(host="1.1.1.1", count=5):
         try:
             cmd = []
             if OS_NAME in ("Darwin", "Linux"):
-                cmd = ["ping", "-c", str(count), host]
+                cmd = ["ping", "-c", str(count), "-i", "0.1", host]
             elif OS_NAME == "Windows":
                 cmd = ["ping", "-n", str(count), host]
 
@@ -549,7 +603,7 @@ def test_latency(host="1.1.1.1", count=5):
                         prefix = match.group(1).lower()
                         if prefix != "ttl":
                             latencies.append(float(match.group(2)))
-                stats = compute_stats(latencies, "ICMP")
+                stats = compute_stats(latencies, "ICMP", total_count=count)
                 if stats:
                     return stats, True
         except Exception:
@@ -558,7 +612,7 @@ def test_latency(host="1.1.1.1", count=5):
     return test_tcp_latency(host, port=443, count=count), False
 
 
-def compute_stats(latencies, type_str):
+def compute_stats(latencies, type_str, total_count=None):
     if not latencies:
         return None
     avg_lat = sum(latencies) / len(latencies)
@@ -566,11 +620,16 @@ def compute_stats(latencies, type_str):
     max_lat = max(latencies)
     variance = sum((x - avg_lat) ** 2 for x in latencies) / len(latencies)
     stddev = variance**0.5
+    count = (
+        total_count if total_count and total_count >= len(latencies) else len(latencies)
+    )
+    loss = round(((count - len(latencies)) / count) * 100, 1)
     return {
         "min": round(min_lat, 3),
         "avg": round(avg_lat, 3),
         "max": round(max_lat, 3),
         "stddev": round(stddev, 3),
+        "loss": loss,
         "type": type_str,
     }
 
@@ -589,50 +648,99 @@ def build_dns_query(domain):
 
 # [CHANGE 4] Parallelize domain queries within each resolver. Previously they
 # were sequential: one 0.8s timeout would block the next domain query.
-# Worst case per-resolver latency: was 4 * 0.8s = 3.2s, now max(0.8s).
-def benchmark_single_resolver(name, ip, test_domains, timeout=0.8):
-    def query_one(domain):
+async def _async_query_dns(ip: str, domain: str, timeout: float = 0.8) -> float | None:
+    loop = asyncio.get_running_loop()
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    eff_timeout = (
+        min(timeout, 0.15) if family == socket.AF_INET6 else min(timeout, 0.25)
+    )
+
+    class DNSDatagramProtocol(asyncio.DatagramProtocol):
+        def __init__(self):
+            self.future = loop.create_future()
+
+        def datagram_received(self, data, addr):
+            if not self.future.done():
+                self.future.set_result(data)
+
+        def error_received(self, exc):
+            if not self.future.done():
+                self.future.set_exception(exc)
+
+    try:
+        transport, protocol = await loop.create_datagram_endpoint(
+            DNSDatagramProtocol,
+            remote_addr=(ip, 53),
+            family=family,
+        )
+        query = build_dns_query(domain)
+        t_start = time.perf_counter()
+        transport.sendto(query)
         try:
-            query = build_dns_query(domain)
-            family = socket.AF_INET6 if ":" in ip else socket.AF_INET
-            sock = socket.socket(family, socket.SOCK_DGRAM)
-            sock.settimeout(timeout)
-            t_start = time.perf_counter()
-            sock.sendto(query, (ip, 53))
-            data, _ = sock.recvfrom(512)
+            data = await asyncio.wait_for(protocol.future, timeout=eff_timeout)
             t_end = time.perf_counter()
-            sock.close()
             if len(data) >= 12 and (data[3] & 0x0F) == 0:
                 return (t_end - t_start) * 1000.0
             return None
-        except Exception:
-            return None  # non-fatal: one of len(test_domains) parallel queries; None filtered
+        finally:
+            transport.close()
+    except Exception:
+        return None
 
-    with ThreadPoolExecutor(max_workers=len(test_domains)) as ex:
-        results = list(ex.map(query_one, test_domains))
+
+async def _async_benchmark_resolver(
+    name: str, ip: str, test_domains: list[str], timeout: float = 0.8
+):
+    tasks = [_async_query_dns(ip, domain, timeout) for domain in test_domains]
+    results = await asyncio.gather(*tasks)
     latencies = [r for r in results if r is not None]
     if latencies:
         return name, {"ip": ip, "avg": round(sum(latencies) / len(latencies), 2)}
     return name, None
 
 
+async def _async_benchmark_dns(
+    resolvers: dict[str, str], test_domains: list[str], timeout: float = 0.8
+):
+    tasks = [
+        _async_benchmark_resolver(name, ip, test_domains, timeout)
+        for name, ip in resolvers.items()
+    ]
+    res_list = await asyncio.gather(*tasks)
+    return {name: data for name, data in res_list if data is not None}
+
+
+def benchmark_single_resolver(name, ip, test_domains, timeout=0.8):
+    try:
+        return asyncio.run(_async_benchmark_resolver(name, ip, test_domains, timeout))
+    except Exception:
+        return name, None
+
+
 def benchmark_dns(
     interface,
-    test_domains=["google.com", "cloudflare.com", "github.com", "wikipedia.org"],
+    test_domains=None,
     timeout=0.8,
 ):
-    print("Benchmarking DNS resolver latencies (concurrent queries)...")
+    if test_domains is None:
+        test_domains = ["google.com", "cloudflare.com", "github.com", "wikipedia.org"]
     resolvers = {
         "Cloudflare Primary": "1.1.1.1",
         "Cloudflare Secondary": "1.0.0.1",
         "Google Primary": "8.8.8.8",
         "Google Secondary": "8.8.4.4",
         "Quad9 Secure": "9.9.9.9",
+        "OpenDNS Primary": "208.67.222.222",
+        "OpenDNS Secondary": "208.67.220.220",
+        "AdGuard DNS": "94.140.14.14",
+        "Control D": "76.76.2.0",
         "Cloudflare Primary IPv6": "2606:4700:4700::1111",
         "Cloudflare Secondary IPv6": "2606:4700:4700::1001",
         "Google Primary IPv6": "2001:4860:4860::8888",
         "Google Secondary IPv6": "2001:4860:4860::8844",
         "Quad9 Secure IPv6": "2620:fe::fe",
+        "OpenDNS Primary IPv6": "2620:119:35::35",
+        "AdGuard DNS IPv6": "2a10:50c0::ad1:ff",
     }
 
     system_dns = get_dns_servers(interface)
@@ -640,39 +748,26 @@ def benchmark_dns(
         if ip not in resolvers.values():
             resolvers[f"Current System DNS {idx + 1}"] = ip
 
-    results = {}
-
-    with ThreadPoolExecutor(max_workers=len(resolvers)) as executor:
-        futures = [
-            executor.submit(benchmark_single_resolver, name, ip, test_domains, timeout)
-            for name, ip in resolvers.items()
-        ]
-        for future in futures:
-            name, res = future.result()
-            if res:
-                results[name] = res
-
-    return results
+    try:
+        return asyncio.run(_async_benchmark_dns(resolvers, test_domains, timeout))
+    except Exception:
+        return {}
 
 
 def discover_pmtu(icmp_supported, host="1.1.1.1"):
     if not icmp_supported:
         return None
-    print("Analyzing Path MTU (PMTUD)...")
     sizes = [1472, 1464, 1452, 1400, 1300, 1200]
     optimal_payload = None
 
     for size in sizes:
         try:
             if OS_NAME == "Darwin":
-                cmd = ["ping", "-D", "-s", str(size), "-c", "2", "-t", "1", host]
+                cmd = ["ping", "-D", "-s", str(size), "-c", "1", "-t", "1", host]
             elif OS_NAME == "Linux":
-                cmd = ["ping", "-M", "do", "-s", str(size), "-c", "2", "-W", "1", host]
+                cmd = ["ping", "-M", "do", "-s", str(size), "-c", "1", "-W", "1", host]
             elif OS_NAME == "Windows":
-                cmd = ["ping", "-f", "-l", str(size), "-n", "2", "-w", "1000", host]
-            else:
-                continue
-
+                cmd = ["ping", "-f", "-l", str(size), "-n", "1", "-w", "1000", host]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0)
             if result.returncode == 0 and "100%" not in result.stdout:
                 optimal_payload = size
@@ -685,325 +780,48 @@ def discover_pmtu(icmp_supported, host="1.1.1.1"):
     return None
 
 
-def get_occupied_channels(ch_num, band, width):
-    try:
-        ch = int(ch_num)
-    except (ValueError, TypeError):
-        return []
-
-    if band == "2GHz":
-        return [str(x) for x in range(max(1, ch - 4), min(15, ch + 5))]
-
-    if width == 40:
-        pairs = [
-            {36, 40},
-            {44, 48},
-            {52, 56},
-            {60, 64},
-            {100, 104},
-            {108, 112},
-            {116, 120},
-            {124, 128},
-            {132, 136},
-            {140, 144},
-            {149, 153},
-            {157, 161},
-        ]
-        for pair in pairs:
-            if ch in pair:
-                return [str(x) for x in pair]
-        return (
-            [str(ch), str(ch + 4)]
-            if ch % 8 == 4 or ch % 8 == 5
-            else [str(ch), str(ch - 4)]
-        )
-
-    elif width == 80:
-        groups = [
-            {36, 40, 44, 48},
-            {52, 56, 60, 64},
-            {100, 104, 108, 112},
-            {116, 120, 124, 128},
-            {132, 136, 140, 144},
-            {149, 153, 157, 161},
-        ]
-        for group in groups:
-            if ch in group:
-                return [str(x) for x in group]
-        if band == "6GHz":
-            base = 1
-            while base <= 233:
-                group = {base, base + 4, base + 8, base + 12}
-                if ch in group:
-                    return [str(x) for x in group]
-                base += 16
-        return [str(x) for x in range(ch - 6, ch + 7) if x > 0 and (x - ch) % 4 == 0]
-
-    elif width == 160:
-        groups = [
-            {36, 40, 44, 48, 52, 56, 60, 64},
-            {100, 104, 108, 112, 116, 120, 124, 128},
-        ]
-        for group in groups:
-            if ch in group:
-                return [str(x) for x in group]
-        if band == "6GHz":
-            base = 1
-            while base <= 233:
-                group = {base + 4 * i for i in range(8)}
-                if ch in group:
-                    return [str(x) for x in group]
-                base += 32
-        return [str(x) for x in range(ch - 14, ch + 15) if x > 0 and (x - ch) % 4 == 0]
-
-    return [str(ch)]
-
-
-def _parse_channel_band(ch_str):
-    """
-    Parse a channel string of the form produced by system_profiler JSON:
-      '64 (5GHz, 80MHz)' -> ('64', '5GHz', 80)
-      '6 (2GHz, 20MHz)'  -> ('6',  '2GHz', 20)
-      '37 (6GHz, 80MHz)' -> ('37', '6GHz', 80)
-      '64'               -> ('64', None, 20)
-    Returns (None, None, 20) when the string cannot be parsed.
-    """
-    ch_str = str(ch_str).strip()
-    m = re.match(r"(\d+)\s*(?:\((\d+GHz)(?:,\s*(\d+)MHz)?\))?", ch_str)
-    if m and m.group(1):
-        width = int(m.group(3)) if m.group(3) else 20
-        return m.group(1), m.group(2), width
-    return None, None, 20
-
-
-def _classify_band(ch_num_str, band_str):
-    """
-    Return '2GHz' | '5GHz' | '6GHz' | None.
-    Uses explicit band_str when available; falls back to channel-number heuristics.
-
-    Heuristic: channels 1-14 → 2 GHz (ambiguous with 6 GHz, but 2.4 GHz is more
-    common for low-numbered channels). Channels ≥ 182 → 6 GHz (exclusive range).
-    All others → 5 GHz.
-    """
-    if band_str in ("2GHz", "5GHz", "6GHz"):
-        return band_str
-    try:
-        n = int(ch_num_str)
-        if n <= 14:
-            return "2GHz"
-        if n >= 182:
-            return "6GHz"
-        return "5GHz"
-    except (ValueError, TypeError):
-        return None
-
-
-# macOS: use system_profiler SPAirPortDataType -json for neighbor channel scan.
-# airport -s removed in macOS 15; JSON output avoids space-delimited SSID
-# column-index parsing bugs and the deprecated binary.
-def scan_neighbor_channels():
-    """
-    Returns {"2GHz": {ch: count}, "5GHz": {ch: count}, "6GHz": {ch: count}}.
-
-    macOS JSON path (primary): parses spairport_network_channel strings such as
-    '6 (2GHz, 20MHz)' via _parse_channel_band — band is explicit, no heuristic needed.
-    macOS text path (fallback): used when JSON returns no neighbor data.
-    Linux: nmcli -f CHAN,FREQ; frequency used for band classification.
-    Windows: netsh wlan; channel-number heuristic for band.
-    """
-    channels: dict[str, dict[str, int]] = {"2GHz": {}, "5GHz": {}, "6GHz": {}}
-    if is_bsd():
-        return channels
-
-    def record_neighbor(ch_num, band, width):
-        key = _classify_band(ch_num, band)
-        if not key:
-            return
-        occupied = get_occupied_channels(ch_num, key, width)
-        for c in occupied:
-            channels[key][c] = channels[key].get(c, 0) + 1
-
-    try:
-        if OS_NAME == "Darwin":
-            data = _get_airport_json()
-            if data:
-                try:
-                    interfaces = data.get("SPAirPortDataType", [{}])[0].get(
-                        "spairport_airport_interfaces", []
-                    )
-                    for iface in interfaces:
-                        other_nets = iface.get(
-                            "spairport_airport_other_local_wireless_networks", []
-                        )
-                        for net in other_nets:
-                            ch_str = net.get("spairport_network_channel", "")
-                            ch_num, band, width = _parse_channel_band(ch_str)
-                            if ch_num is None:
-                                continue
-                            record_neighbor(ch_num, band, width)
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    pass  # non-fatal: falls to text parser fallback below
-
-            if not any(channels.values()):
-                # Fallback: system_profiler text output (no -json flag)
-                result = subprocess.run(
-                    ["system_profiler", "SPAirPortDataType"],
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode == 0:
-                    # e.g. "Channel: 64 (5GHz, 80MHz)" or "Channel: 6"
-                    matches = re.findall(
-                        r"Channel:\s*(\d+)\s*(?:\((\d+GHz)(?:,\s*(\d+)MHz)?\))?",
-                        result.stdout,
-                    )
-                    for ch_num, band, width_str in matches:
-                        width = int(width_str) if width_str else 20
-                        record_neighbor(ch_num, band, width)
-
-        elif OS_NAME == "Windows":
-            result = subprocess.run(
-                ["netsh", "wlan", "show", "networks", "mode=bssid"],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    line_lower = line.lower()
-                    if (
-                        "channel" in line_lower
-                        or "kanal" in line_lower
-                        or "canal" in line_lower
-                    ):
-                        parts = line.split(":", 1)
-                        if len(parts) > 1:
-                            ch = parts[1].strip()
-                            if ch.isdigit():
-                                record_neighbor(ch, None, 20)
-
-        elif OS_NAME == "Linux":
-            result = subprocess.run(
-                ["nmcli", "-f", "CHAN,FREQ", "dev", "wifi", "list"],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines()[1:]:
-                    parts = line.split()
-                    if len(parts) < 2:
-                        continue
-                    ch = parts[0].strip()
-                    if not ch.isdigit():
-                        continue
-                    try:
-                        # nmcli may use locale decimal separator and GHz or MHz unit.
-                        # Examples: "2,437 GHz", "5.180 GHz", "2412 MHz", "5180"
-                        freq_str = parts[1].replace(",", ".")
-                        freq_val = float(freq_str)
-                        unit = parts[2].upper() if len(parts) > 2 else ""
-                        # Treat as GHz if unit says so, or if value is < 100 (bare GHz float)
-                        if unit == "GHZ" or freq_val < 100:
-                            freq_mhz = freq_val * 1000.0
-                        else:
-                            freq_mhz = freq_val  # already MHz
-                        if freq_mhz >= 5925:
-                            key = "6GHz"
-                        elif freq_mhz >= 5000:
-                            key = "5GHz"
-                        else:
-                            key = "2GHz"
-                    except (ValueError, IndexError):
-                        key = _classify_band(ch, None)
-                    record_neighbor(ch, key, 20)
-
-    except Exception as e:
-        _warn(f"neighbor channel scan failed: {e}")
-    return channels
-
-
-def bg_scan_channels():
-    global neighbor_channels
-    neighbor_channels = scan_neighbor_channels()
-
-
 def print_latency_results(latency):
     if latency:
-        print(f"  Type      : {latency['type']}")
-        print(f"  Avg RTT   : {latency['avg']} ms")
-        print(f"  Min RTT   : {latency['min']} ms")
-        print(f"  Max RTT   : {latency['max']} ms")
-        print(f"  Jitter    : {latency['stddev']} ms")
+        print("Latency:")
+        loss_str = f", loss {latency['loss']}%" if "loss" in latency else ""
+        print(
+            f"  {latency['type']} avg {latency['avg']} ms "
+            f"(min {latency['min']} ms, max {latency['max']} ms, jitter {latency['stddev']} ms{loss_str})"
+        )
+        if latency.get("loss", 0.0) > 0.0:
+            print(
+                f"  warning: {latency['loss']}% packet loss detected — check Wi-Fi distance or radio interference."
+            )
     else:
-        print("  Latency check failed.")
+        print("Latency: check failed.")
 
 
-def get_channel_recommendation(ch_by_band):
-    """
-    Returns (rec_24, rec_5, rec_6).
-    rec_6 is None when no 6 GHz neighbors are visible (ch_by_band['6GHz'] is empty).
+def apply_dns(interface, dns_ip, fallback_dns=None):
+    dns_servers = [dns_ip]
+    if fallback_dns and fallback_dns != dns_ip:
+        dns_servers.append(fallback_dns)
 
-    ch_by_band must be {"2GHz": {ch: count}, "5GHz": {ch: count}, "6GHz": {ch: count}}.
+    if verify_dns(interface, dns_ip):
+        print("              DNS configuration already active.")
+        return True
 
-    c_6 uses Wi-Fi 6E Preferred Scanning Channels (PSC): every 4th channel starting at 5,
-    spaced 80 MHz apart across UNII-5 through UNII-8 (5.925–7.125 GHz).
-    """
-    c_24 = ["1", "6", "11"]
-    c_5 = ["36", "40", "44", "48", "149", "153", "157", "161"]
-    c_6 = [
-        "5",
-        "21",
-        "37",
-        "53",
-        "69",
-        "85",
-        "101",
-        "117",
-        "133",
-        "149",
-        "165",
-        "181",
-        "197",
-        "213",
-        "229",
-    ]
-
-    ch_24 = ch_by_band.get("2GHz", {})
-    ch_5 = ch_by_band.get("5GHz", {})
-    ch_6 = ch_by_band.get("6GHz", {})
-
-    congestion_24 = {ch: ch_24.get(ch, 0) for ch in c_24}
-    congestion_5 = {ch: ch_5.get(ch, 0) for ch in c_5}
-
-    rec_24 = min(congestion_24, key=congestion_24.__getitem__)
-    rec_5 = min(congestion_5, key=congestion_5.__getitem__)
-
-    if ch_6:
-        congestion_6 = {ch: ch_6.get(ch, 0) for ch in c_6}
-        rec_6 = min(congestion_6, key=congestion_6.__getitem__)
-    else:
-        rec_6 = None
-
-    return rec_24, rec_5, rec_6
-
-
-def apply_dns(interface, dns_ip):
-    print(f"[*] Applying DNS: Configuration targeting {dns_ip}...")
     is_v6 = ":" in dns_ip
     family_cmd = "ipv6" if is_v6 else "ipv4"
     if OS_NAME == "Darwin":
         service = get_macos_service_name(interface)
-        cmd = ["sudo", "networksetup", "-setdnsservers", service, dns_ip]
-    elif OS_NAME == "Linux" or is_bsd():
+        cmd = ["sudo", "networksetup", "-setdnsservers", service] + dns_servers
+    elif _is_linux_or_bsd():
         try:
             if OS_NAME == "Linux":
                 subprocess.run(
                     ["resolvectl", "--version"], capture_output=True, check=True
                 )
-                cmd = ["sudo", "resolvectl", "dns", interface, dns_ip]
+                cmd = ["sudo", "resolvectl", "dns", interface] + dns_servers
             else:
                 raise Exception("Not Linux")
         except Exception:
-            cmd = ["sudo", "sh", "-c", f"echo 'nameserver {dns_ip}' > /etc/resolv.conf"]
+            resolv_content = "".join(f"nameserver {ip}\n" for ip in dns_servers)
+            cmd = ["sudo", "sh", "-c", f"printf '{resolv_content}' > /etc/resolv.conf"]
     elif OS_NAME == "Windows":
         cmd = [
             "netsh",
@@ -1016,19 +834,32 @@ def apply_dns(interface, dns_ip):
             dns_ip,
         ]
         if not is_admin():
-            print(
-                "    Elevation required. Please run this script inside an Administrator terminal."
-            )
+            _warn("Elevation required to set DNS on Windows.")
             return False
     else:
         return False
 
     try:
         subprocess.run(cmd, check=True)
-        print("    DNS configuration applied successfully.")
+        if OS_NAME == "Windows" and len(dns_servers) > 1:
+            with contextlib.suppress(Exception):
+                subprocess.run(
+                    [
+                        "netsh",
+                        "interface",
+                        "ipv6" if ":" in dns_servers[1] else "ipv4",
+                        "add",
+                        "dns",
+                        f"name={interface}",
+                        dns_servers[1],
+                        "index=2",
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
         return True
     except subprocess.CalledProcessError as e:
-        print(f"    Failed to apply DNS configuration: {e}")
+        _warn(f"Failed to apply DNS configuration: {e}")
         return False
 
 
@@ -1040,6 +871,13 @@ def verify_dns(interface, dns_ip):
     family_cmd = "ipv6" if is_v6 else "ipv4"
     try:
         if OS_NAME == "Darwin":
+            result = subprocess.run(
+                ["scutil", "--dns"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return dns_ip in result.stdout
             service = get_macos_service_name(interface)
             result = subprocess.run(
                 ["networksetup", "-getdnsservers", service],
@@ -1049,7 +887,7 @@ def verify_dns(interface, dns_ip):
             return dns_ip in [
                 line.strip() for line in result.stdout.splitlines() if line.strip()
             ]
-        elif OS_NAME == "Linux" or is_bsd():
+        if _is_linux_or_bsd():
             # resolvectl-managed systems do not write to /etc/resolv.conf;
             # check resolvectl status first, fall back for non-systemd systems.
             try:
@@ -1060,16 +898,13 @@ def verify_dns(interface, dns_ip):
                         text=True,
                     )
                     if result.returncode == 0:
-                        ip_pattern = re.compile(
-                            r"\b(?:\d{1,3}\.){3}\d{1,3}\b|(?:::[0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}:[0-9a-fA-F:]+)"
-                        )
-                        ips = ip_pattern.findall(result.stdout)
+                        ips = _IP_RE.findall(result.stdout)
                         return dns_ip in ips
                 else:
                     raise Exception("Not Linux")
             except Exception:
                 pass  # non-fatal: resolvectl absent; falls to /etc/resolv.conf
-            with open("/etc/resolv.conf", "r") as f:
+            with open("/etc/resolv.conf") as f:
                 for line in f:
                     if line.startswith("nameserver"):
                         parts = line.split()
@@ -1082,10 +917,7 @@ def verify_dns(interface, dns_ip):
                 capture_output=True,
                 text=True,
             )
-            ip_pattern = re.compile(
-                r"\b(?:\d{1,3}\.){3}\d{1,3}\b|(?:::[0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}:[0-9a-fA-F:]+)"
-            )
-            ips = ip_pattern.findall(result.stdout)
+            ips = _IP_RE.findall(result.stdout)
             return dns_ip in ips
     except Exception:
         pass  # non-fatal: verify_dns returns False; caller prints warning + revert hint
@@ -1093,7 +925,6 @@ def verify_dns(interface, dns_ip):
 
 
 def apply_mtu(interface, mtu_size):
-    print(f"[*] Applying MTU: Configuration targeting {mtu_size} bytes...")
     if OS_NAME == "Darwin" or is_bsd():
         cmd = ["sudo", "ifconfig", interface, "mtu", str(mtu_size)]
     elif OS_NAME == "Linux":
@@ -1110,41 +941,34 @@ def apply_mtu(interface, mtu_size):
             "store=persistent",
         ]
         if not is_admin():
-            print(
-                "    Elevation required. Please run this script inside an Administrator terminal."
-            )
+            _warn("Elevation required to set MTU on Windows.")
             return False
     else:
         return False
 
     try:
         subprocess.run(cmd, check=True)
-        print("    MTU configuration applied successfully.")
         return True
     except subprocess.CalledProcessError as e:
-        print(f"    Failed to apply MTU configuration: {e}")
+        _warn(f"Failed to apply MTU configuration: {e}")
         return False
 
 
 def flush_dns_cache():
-    print("[*] Flushing system DNS cache...")
     if OS_NAME == "Darwin":
         try:
             subprocess.run(["sudo", "dscacheutil", "-flushcache"], check=True)
             subprocess.run(["sudo", "killall", "-HUP", "mDNSResponder"], check=True)
-            print("    DNS cache flushed.")
         except Exception:
             _warn("DNS cache flush failed (dscacheutil/mDNSResponder).")
     elif OS_NAME == "Linux":
         try:
             subprocess.run(["sudo", "resolvectl", "flush-caches"], check=True)
-            print("    DNS cache flushed.")
         except Exception:
             try:
                 subprocess.run(
                     ["sudo", "systemd-resolve", "--flush-caches"], check=True
                 )
-                print("    DNS cache flushed.")
             except Exception:
                 _warn(
                     "DNS cache flush failed (resolvectl and systemd-resolve both unavailable)."
@@ -1152,7 +976,6 @@ def flush_dns_cache():
     elif OS_NAME == "Windows":
         try:
             subprocess.run(["ipconfig", "/flushdns"], check=True)
-            print("    DNS cache flushed.")
         except Exception:
             _warn("DNS cache flush failed (ipconfig /flushdns).")
 
@@ -1163,7 +986,7 @@ def flush_dns_cache():
 # Read and write are done inside a single privileged python3 invocation to
 # close the TOCTOU window that existed when the file was read as the current
 # user and then written via a separate sudo tee call.
-def _persist_sysctl(key, val):
+def _persist_sysctl_dict(kv_dict: dict[str, str]) -> None:
     if OS_NAME == "Darwin" or is_bsd():
         conf_path = "/etc/sysctl.conf"
     elif OS_NAME == "Linux":
@@ -1171,21 +994,21 @@ def _persist_sysctl(key, val):
     else:
         return
 
-    # Build a self-contained script; key/val are repr'd so no shell quoting is
-    # needed and no shell-metacharacter injection is possible.
     script = (
         "import os\n"
         f"path = {conf_path!r}\n"
-        f"key = {key!r}\n"
-        f"val = {val!r}\n"
-        "setting = f'{key}={val}\\n'\n"
+        f"kv = {kv_dict!r}\n"
         "lines = open(path).readlines() if os.path.exists(path) else []\n"
-        "updated = False\n"
+        "kv_rem = dict(kv)\n"
         "for i, line in enumerate(lines):\n"
         "    s = line.strip()\n"
-        "    if s.startswith(f'{key}=') or s.startswith(f'{key} ='):\n"
-        "        lines[i] = setting; updated = True; break\n"
-        "if not updated: lines.append(setting)\n"
+        "    for k, v in list(kv_rem.items()):\n"
+        "        if s.startswith(f'{k}=') or s.startswith(f'{k} ='):\n"
+        "            lines[i] = f'{k}={v}\\n'\n"
+        "            del kv_rem[k]\n"
+        "            break\n"
+        "for k, v in kv_rem.items():\n"
+        "    lines.append(f'{k}={v}\\n')\n"
         "open(path, 'w').writelines(lines)\n"
     )
     try:
@@ -1193,127 +1016,79 @@ def _persist_sysctl(key, val):
             ["sudo", "python3", "-c", script], capture_output=True, text=True
         )
         if result.returncode != 0:
-            print(f"    Warning: Could not persist {key} to {conf_path}")
+            print(f"    Warning: Could not persist sysctl to {conf_path}")
     except Exception as e:
-        print(f"    Warning: Could not persist {key}: {e}")
+        print(f"    Warning: Could not persist sysctl: {e}")
 
 
-# [CHANGE 7] delayed_ack=0 moved to --gaming flag: disabling it hurts bulk
-# throughput (large file transfers, streaming) while only helping interactive
-# traffic (gaming, VoIP, WebRTC). Default run is now bulk-throughput safe.
-# [CHANGE 9] Added missing is_admin() guard for Windows before netsh calls.
-def apply_sysctl_optimizations(gaming=False):
-    print(
-        "[*] Tuning TCP/IP kernel stack parameters for lower RTT and zero fragmentation..."
+def _persist_sysctl(key, val):
+    _persist_sysctl_dict({key: val})
+
+
+def _apply_sysctl_dict(optimizations: dict[str, str]) -> None:
+    _persist_sysctl_dict(optimizations)
+    if OS_NAME in ("Darwin", "Linux") or is_bsd():
+        try:
+            cmd = ["sudo", "sysctl", "-w"] + [
+                f"{k}={v}" for k, v in optimizations.items()
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+        except Exception as e:
+            _warn(f"Failed to apply sysctl batch: {e}")
+
+
+def _revert_sysctl(backup: dict | None, default_sysctl: dict[str, str]) -> None:
+    sysctl_values = (
+        backup["sysctl"] if (backup and "sysctl" in backup) else default_sysctl
     )
-    if OS_NAME == "Darwin":
-        optimizations = {
-            "net.inet.tcp.mssdflt": "1460",  # Optimal IPv4 segment size (avoids fragmentation overhead)
-            "net.inet.tcp.v6mssdflt": "1440",  # Optimal IPv6 segment size (eliminates 40% IPv6 packet overhead)
-            "net.inet.tcp.win_scale_factor": "8",  # Expands receive window size limit
-            "net.inet.tcp.sendspace": "1048576",  # Expand send buffer to 1MB
-            "net.inet.tcp.recvspace": "1048576",  # Expand receive buffer to 1MB
-            "net.inet.tcp.fastopen": "3",  # Enable TCP Fast Open (client & server)
-            "net.inet.tcp.always_keepalive": "1",  # Force TCP keep-alive on all sockets
-            "net.inet.tcp.keepidle": "30000",  # Probe idle sockets after 30s (prevents NAT drop)
-            "net.inet.tcp.keepintvl": "5000",  # Keep-alive retry interval 5s
-        }
-        if gaming:
-            optimizations["net.inet.tcp.delayed_ack"] = (
-                "0"  # Immediate ACKs (resolves gaming/WebRTC jitter)
+    for key, val in default_sysctl.items():
+        backup_val = sysctl_values.get(key)
+        target_val = backup_val or val
+        try:
+            subprocess.run(
+                ["sudo", "sysctl", "-w", f"{key}={target_val}"],
+                check=True,
+                capture_output=True,
             )
-        for key, val in optimizations.items():
-            try:
-                print(f"    Setting {key} = {val}...")
-                subprocess.run(
-                    ["sudo", "sysctl", "-w", f"{key}={val}"],
-                    check=True,
-                    capture_output=True,
-                )
-                _persist_sysctl(key, val)
-            except Exception as e:
-                print(f"    Failed to apply {key}: {e}")
+            _persist_sysctl(key, target_val)
+        except Exception as e:
+            _warn(f"Failed to revert sysctl {key}: {e}")
+
+
+def apply_sysctl_optimizations(gaming=False):
+    if OS_NAME == "Darwin":
+        optimizations = dict(_MACOS_SYSCTL_OPTIMIZATIONS)
+        if gaming:
+            optimizations["net.inet.tcp.delayed_ack"] = "0"
+        _apply_sysctl_dict(optimizations)
     elif OS_NAME == "Linux":
-        optimizations = {
-            "net.ipv4.tcp_slow_start_after_idle": "0",
-            "net.ipv4.tcp_notsent_lowat": "16384",
-        }
-        for key, val in optimizations.items():
-            try:
-                print(f"    Setting {key} = {val}...")
-                subprocess.run(
-                    ["sudo", "sysctl", "-w", f"{key}={val}"],
-                    check=True,
-                    capture_output=True,
-                )
-                _persist_sysctl(key, val)
-            except Exception as e:
-                print(f"    Failed to apply {key}: {e}")
+        _apply_sysctl_dict(_LINUX_SYSCTL_OPTIMIZATIONS)
     elif is_bsd():
-        optimizations = {
-            "net.inet.tcp.mssdflt": "1460",
-        }
-        for key, val in optimizations.items():
-            try:
-                print(f"    Setting {key} = {val}...")
-                subprocess.run(
-                    ["sudo", "sysctl", "-w", f"{key}={val}"],
-                    check=True,
-                    capture_output=True,
-                )
-                _persist_sysctl(key, val)
-            except Exception as e:
-                print(f"    Failed to apply {key}: {e}")
+        _apply_sysctl_dict(_BSD_SYSCTL_OPTIMIZATIONS)
     elif OS_NAME == "Windows":
         if not is_admin():
-            print(
-                "    Elevation required to tune TCP/IP parameters. Run as Administrator."
-            )
+            _warn("Elevation required to tune TCP/IP parameters on Windows.")
             return
-        optimizations = {
-            "autotuninglevel": "normal",
-            "rss": "enabled",
-            "fastopen": "enabled",
-            "ecncapability": "enabled",
-        }
-        for key, val in optimizations.items():
+        for key, val in _WINDOWS_TCP_DEFAULTS.items():
             try:
-                print(f"    Setting TCP global {key} = {val}...")
                 subprocess.run(
                     ["netsh", "int", "tcp", "set", "global", f"{key}={val}"],
                     check=True,
                     capture_output=True,
                 )
             except Exception as e:
-                print(f"    Failed to apply {key}: {e}")
+                _warn(f"Failed to apply {key}: {e}")
 
 
 def apply_power_save_optimization(interface: str, gaming: bool = False) -> bool:
-    print("[*] Tuning Wi-Fi adapter power management...")
     if OS_NAME == "Darwin":
         if not gaming:
             return False
         try:
-            result = subprocess.run(
-                ["pmset", "-g"],
-                capture_output=True,
-                text=True,
-            )
-            sleep_val = "1"
-            for line in result.stdout.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("sleep"):
-                    parts = stripped.split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        sleep_val = parts[1]
-                        break
             subprocess.run(
                 ["sudo", "pmset", "-a", "sleep", "0"],
                 check=True,
                 capture_output=True,
-            )
-            print(
-                f"    System sleep disabled (was {sleep_val}). Wi-Fi radio stays fully active."
             )
             return True
         except Exception as e:
@@ -1335,10 +1110,11 @@ def apply_power_save_optimization(interface: str, gaming: bool = False) -> bool:
             _warn("Elevation required to disable Wi-Fi power management on Windows.")
             return False
         try:
+            ps_iface = interface.replace("'", "''")
             cmd = [
                 "powershell",
                 "-Command",
-                f"Set-NetAdapterPowerManagement -Name '{interface}' -AllowComputerToTurnOffDevice $false",
+                f"Set-NetAdapterPowerManagement -Name '{ps_iface}' -AllowComputerToTurnOffDevice $false",
             ]
             subprocess.run(cmd, check=True, capture_output=True)
             print("    Wi-Fi adapter power management disabled.")
@@ -1350,10 +1126,11 @@ def apply_power_save_optimization(interface: str, gaming: bool = False) -> bool:
 
 def get_windows_roaming_aggressiveness(interface: str) -> str | None:
     try:
+        ps_iface = interface.replace("'", "''")
         cmd = [
             "powershell",
             "-Command",
-            f"(Get-NetAdapterAdvancedProperty -Name '{interface}' -RegistryKeyword 'RoamingSensitivityLevel').RegistryValue",
+            f"(Get-NetAdapterAdvancedProperty -Name '{ps_iface}' -RegistryKeyword 'RoamingSensitivityLevel').RegistryValue",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0 and result.stdout.strip():
@@ -1365,10 +1142,12 @@ def get_windows_roaming_aggressiveness(interface: str) -> str | None:
 
 def set_windows_roaming_aggressiveness(interface: str, value: str) -> bool:
     try:
+        ps_iface = interface.replace("'", "''")
+        ps_val = value.replace("'", "''")
         cmd = [
             "powershell",
             "-Command",
-            f"Set-NetAdapterAdvancedProperty -Name '{interface}' -RegistryKeyword 'RoamingSensitivityLevel' -RegistryValue '{value}'",
+            f"Set-NetAdapterAdvancedProperty -Name '{ps_iface}' -RegistryKeyword 'RoamingSensitivityLevel' -RegistryValue '{ps_val}'",
         ]
         subprocess.run(cmd, check=True, capture_output=True)
         return True
@@ -1480,47 +1259,14 @@ def save_backup(interface: str) -> None:
         "power_save": True,
     }
     if OS_NAME == "Darwin":
-        backup["sysctl"]["net.inet.tcp.mssdflt"] = get_sysctl_value(
-            "net.inet.tcp.mssdflt"
-        )
-        backup["sysctl"]["net.inet.tcp.v6mssdflt"] = get_sysctl_value(
-            "net.inet.tcp.v6mssdflt"
-        )
-        backup["sysctl"]["net.inet.tcp.win_scale_factor"] = get_sysctl_value(
-            "net.inet.tcp.win_scale_factor"
-        )
-        backup["sysctl"]["net.inet.tcp.delayed_ack"] = get_sysctl_value(
-            "net.inet.tcp.delayed_ack"
-        )
-        backup["sysctl"]["net.inet.tcp.sendspace"] = get_sysctl_value(
-            "net.inet.tcp.sendspace"
-        )
-        backup["sysctl"]["net.inet.tcp.recvspace"] = get_sysctl_value(
-            "net.inet.tcp.recvspace"
-        )
-        backup["sysctl"]["net.inet.tcp.fastopen"] = get_sysctl_value(
-            "net.inet.tcp.fastopen"
-        )
-        backup["sysctl"]["net.inet.tcp.always_keepalive"] = get_sysctl_value(
-            "net.inet.tcp.always_keepalive"
-        )
-        backup["sysctl"]["net.inet.tcp.keepidle"] = get_sysctl_value(
-            "net.inet.tcp.keepidle"
-        )
-        backup["sysctl"]["net.inet.tcp.keepintvl"] = get_sysctl_value(
-            "net.inet.tcp.keepintvl"
-        )
+        for key in _MACOS_SYSCTL_DEFAULTS:
+            backup["sysctl"][key] = get_sysctl_value(key)
     elif is_bsd():
-        backup["sysctl"]["net.inet.tcp.mssdflt"] = get_sysctl_value(
-            "net.inet.tcp.mssdflt"
-        )
+        for key in _BSD_SYSCTL_DEFAULTS:
+            backup["sysctl"][key] = get_sysctl_value(key)
     elif OS_NAME == "Linux":
-        backup["sysctl"]["net.ipv4.tcp_slow_start_after_idle"] = get_sysctl_value(
-            "net.ipv4.tcp_slow_start_after_idle"
-        )
-        backup["sysctl"]["net.ipv4.tcp_notsent_lowat"] = get_sysctl_value(
-            "net.ipv4.tcp_notsent_lowat"
-        )
+        for key in _LINUX_SYSCTL_DEFAULTS:
+            backup["sysctl"][key] = get_sysctl_value(key)
     elif OS_NAME == "Windows":
         backup["sysctl"] = get_windows_tcp_settings()
         backup["roaming_aggressiveness"] = get_windows_roaming_aggressiveness(interface)
@@ -1544,12 +1290,46 @@ def save_backup(interface: str) -> None:
         _warn(f"Failed to save backup configurations: {e}")
 
 
+def _revert_dns_to_dhcp(interface: str) -> None:
+    print("[*] Reverting DNS to DHCP...")
+    if OS_NAME == "Darwin":
+        service = get_macos_service_name(interface)
+        subprocess.run(
+            ["sudo", "networksetup", "-setdnsservers", service, "empty"], check=True
+        )
+    elif _is_linux_or_bsd():
+        try:
+            if OS_NAME == "Linux":
+                subprocess.run(["resolvectl", "revert", interface], check=True)
+            else:
+                raise Exception("Not Linux")
+        except Exception:
+            pass
+    elif OS_NAME == "Windows":
+        if is_admin():
+            for family in ["ipv4", "ipv6"]:
+                subprocess.run(
+                    [
+                        "netsh",
+                        "interface",
+                        family,
+                        "set",
+                        "dns",
+                        f"name={interface}",
+                        "dhcp",
+                    ],
+                    check=True,
+                )
+        else:
+            _warn("Elevation required to revert DNS on Windows.")
+
+
 def revert_optimizations(interface: str) -> None:
     print("=== Reverting wifituner Optimizations to System Defaults ===")
     backup = None
     if os.path.exists(BACKUP_PATH):
         try:
-            with open(BACKUP_PATH, "r") as f:
+            with open(BACKUP_PATH) as f:
                 backup = json.load(f)
             print(f"Loaded backup configurations from {BACKUP_PATH}")
         except Exception as e:
@@ -1557,127 +1337,65 @@ def revert_optimizations(interface: str) -> None:
                 f"Failed to read backup file: {e}. Falling back to default system heuristics."
             )
 
-    if backup and "dns" in backup:
+    if backup and backup.get("dns"):
         dns_servers = backup["dns"]
-        if dns_servers:
-            print(f"[*] Restoring backup DNS servers: {dns_servers}")
-            if OS_NAME == "Darwin":
-                service = get_macos_service_name(interface)
-                cmd = ["sudo", "networksetup", "-setdnsservers", service] + dns_servers
-                subprocess.run(cmd, check=True)
-            elif OS_NAME == "Linux" or is_bsd():
-                try:
-                    if OS_NAME == "Linux":
-                        subprocess.run(
-                            ["resolvectl", "--version"], capture_output=True, check=True
-                        )
-                        cmd = ["sudo", "resolvectl", "dns", interface] + dns_servers
-                        subprocess.run(cmd, check=True)
-                    else:
-                        raise Exception("Not Linux")
-                except Exception:
-                    lines = [f"nameserver {ip}\n" for ip in dns_servers]
-                    script = f"open('/etc/resolv.conf', 'w').writelines({lines!r})"
-                    subprocess.run(["sudo", "python3", "-c", script], check=True)
-            elif OS_NAME == "Windows":
-                if is_admin():
-                    first_dns = dns_servers[0]
-                    is_v6 = ":" in first_dns
-                    family_cmd = "ipv6" if is_v6 else "ipv4"
-                    subprocess.run(
-                        [
-                            "netsh",
-                            "interface",
-                            family_cmd,
-                            "set",
-                            "dns",
-                            f"name={interface}",
-                            "static",
-                            first_dns,
-                        ],
-                        check=True,
-                    )
-                    for idx, dns_ip in enumerate(dns_servers[1:], start=2):
-                        is_ip_v6 = ":" in dns_ip
-                        fam_cmd = "ipv6" if is_ip_v6 else "ipv4"
-                        subprocess.run(
-                            [
-                                "netsh",
-                                "interface",
-                                fam_cmd,
-                                "add",
-                                "dns",
-                                f"name={interface}",
-                                dns_ip,
-                                f"index={idx}",
-                            ],
-                            check=True,
-                        )
-                else:
-                    _warn("Elevation required to revert DNS on Windows.")
-        else:
-            print("[*] Reverting DNS to DHCP...")
-            if OS_NAME == "Darwin":
-                service = get_macos_service_name(interface)
-                subprocess.run(
-                    ["sudo", "networksetup", "-setdnsservers", service, "empty"],
-                    check=True,
-                )
-            elif OS_NAME == "Linux" or is_bsd():
-                try:
-                    if OS_NAME == "Linux":
-                        subprocess.run(["resolvectl", "revert", interface], check=True)
-                    else:
-                        raise Exception("Not Linux")
-                except Exception:
-                    pass
-            elif OS_NAME == "Windows":
-                if is_admin():
-                    for family in ["ipv4", "ipv6"]:
-                        subprocess.run(
-                            [
-                                "netsh",
-                                "interface",
-                                family,
-                                "set",
-                                "dns",
-                                f"name={interface}",
-                                "dhcp",
-                            ],
-                            check=True,
-                        )
-                else:
-                    _warn("Elevation required to revert DNS on Windows.")
-    else:
-        print("[*] Reverting DNS to DHCP...")
+        print(f"[*] Restoring backup DNS servers: {dns_servers}")
         if OS_NAME == "Darwin":
             service = get_macos_service_name(interface)
-            subprocess.run(
-                ["sudo", "networksetup", "-setdnsservers", service, "empty"], check=True
-            )
-        elif OS_NAME == "Linux" or is_bsd():
+            cmd = ["sudo", "networksetup", "-setdnsservers", service] + dns_servers
+            subprocess.run(cmd, check=True)
+        elif _is_linux_or_bsd():
             try:
                 if OS_NAME == "Linux":
-                    subprocess.run(["resolvectl", "revert", interface], check=True)
+                    subprocess.run(
+                        ["resolvectl", "--version"], capture_output=True, check=True
+                    )
+                    cmd = ["sudo", "resolvectl", "dns", interface] + dns_servers
+                    subprocess.run(cmd, check=True)
                 else:
                     raise Exception("Not Linux")
             except Exception:
-                pass
+                lines = [f"nameserver {ip}\n" for ip in dns_servers]
+                script = f"open('/etc/resolv.conf', 'w').writelines({lines!r})"
+                subprocess.run(["sudo", "python3", "-c", script], check=True)
         elif OS_NAME == "Windows":
             if is_admin():
-                for family in ["ipv4", "ipv6"]:
+                first_dns = dns_servers[0]
+                is_v6 = ":" in first_dns
+                family_cmd = "ipv6" if is_v6 else "ipv4"
+                subprocess.run(
+                    [
+                        "netsh",
+                        "interface",
+                        family_cmd,
+                        "set",
+                        "dns",
+                        f"name={interface}",
+                        "static",
+                        first_dns,
+                    ],
+                    check=True,
+                )
+                for idx, dns_ip in enumerate(dns_servers[1:], start=2):
+                    is_ip_v6 = ":" in dns_ip
+                    fam_cmd = "ipv6" if is_ip_v6 else "ipv4"
                     subprocess.run(
                         [
                             "netsh",
                             "interface",
-                            family,
-                            "set",
+                            fam_cmd,
+                            "add",
                             "dns",
                             f"name={interface}",
-                            "dhcp",
+                            dns_ip,
+                            f"index={idx}",
                         ],
                         check=True,
                     )
+            else:
+                _warn("Elevation required to revert DNS on Windows.")
+    else:
+        _revert_dns_to_dhcp(interface)
 
     mtu = backup["mtu"] if (backup and "mtu" in backup) else 1500
     print(f"[*] Reverting MTU to {mtu}...")
@@ -1697,7 +1415,7 @@ def revert_optimizations(interface: str) -> None:
             print(f"    System sleep restored to {sleep_val}.")
         except Exception as e:
             _warn(f"Failed to restore system sleep on macOS: {e}")
-    elif OS_NAME == "Linux" or is_bsd():
+    elif _is_linux_or_bsd():
         try:
             if OS_NAME == "Linux":
                 subprocess.run(
@@ -1706,8 +1424,6 @@ def revert_optimizations(interface: str) -> None:
                     capture_output=True,
                 )
                 print("    Wi-Fi power saving re-enabled.")
-            else:
-                pass  # Power saving is not optimized on BSD, so no revert action needed
         except Exception as e:
             _warn(f"Failed to re-enable Wi-Fi power saving: {e}")
     elif OS_NAME == "Windows":
@@ -1739,97 +1455,27 @@ def revert_optimizations(interface: str) -> None:
 
     print("[*] Reverting TCP/IP kernel stack optimizations...")
     if OS_NAME == "Darwin":
-        default_sysctl = {
-            "net.inet.tcp.mssdflt": "512",
-            "net.inet.tcp.v6mssdflt": "1024",
-            "net.inet.tcp.win_scale_factor": "3",
-            "net.inet.tcp.delayed_ack": "3",
-            "net.inet.tcp.sendspace": "524288",
-            "net.inet.tcp.recvspace": "524288",
-            "net.inet.tcp.fastopen": "3",
-            "net.inet.tcp.always_keepalive": "0",
-            "net.inet.tcp.keepidle": "7200000",
-            "net.inet.tcp.keepintvl": "75000",
-        }
-        sysctl_values = (
-            backup["sysctl"] if (backup and "sysctl" in backup) else default_sysctl
-        )
-        for key, val in default_sysctl.items():
-            backup_val = sysctl_values.get(key)
-            target_val = backup_val if backup_val else val
-            try:
-                subprocess.run(
-                    ["sudo", "sysctl", "-w", f"{key}={target_val}"],
-                    check=True,
-                    capture_output=True,
-                )
-                _persist_sysctl(key, target_val)
-            except Exception as e:
-                _warn(f"Failed to revert sysctl {key}: {e}")
-
+        _revert_sysctl(backup, _MACOS_SYSCTL_DEFAULTS)
     elif is_bsd():
-        default_sysctl = {
-            "net.inet.tcp.mssdflt": "512",
-        }
-        sysctl_values = (
-            backup["sysctl"] if (backup and "sysctl" in backup) else default_sysctl
-        )
-        for key, val in default_sysctl.items():
-            backup_val = sysctl_values.get(key)
-            target_val = backup_val if backup_val else val
-            try:
-                subprocess.run(
-                    ["sudo", "sysctl", "-w", f"{key}={target_val}"],
-                    check=True,
-                    capture_output=True,
-                )
-                _persist_sysctl(key, target_val)
-            except Exception as e:
-                _warn(f"Failed to revert sysctl {key}: {e}")
-
+        _revert_sysctl(backup, _BSD_SYSCTL_DEFAULTS)
     elif OS_NAME == "Linux":
-        default_sysctl = {
-            "net.ipv4.tcp_slow_start_after_idle": "1",
-            "net.ipv4.tcp_notsent_lowat": "4294967295",
-        }
-        sysctl_values = (
-            backup["sysctl"] if (backup and "sysctl" in backup) else default_sysctl
-        )
-        for key, val in default_sysctl.items():
-            backup_val = sysctl_values.get(key)
-            target_val = backup_val if backup_val else val
-            try:
-                subprocess.run(
-                    ["sudo", "sysctl", "-w", f"{key}={target_val}"],
-                    check=True,
-                    capture_output=True,
-                )
-                _persist_sysctl(key, target_val)
-            except Exception as e:
-                _warn(f"Failed to revert sysctl {key}: {e}")
-        try:
+        _revert_sysctl(backup, _LINUX_SYSCTL_DEFAULTS)
+        with contextlib.suppress(Exception):
             subprocess.run(
                 ["sudo", "rm", "-f", "/etc/sysctl.d/99-wifituner.conf"],
                 check=True,
                 capture_output=True,
             )
-        except Exception:
-            pass
-
     elif OS_NAME == "Windows":
         if is_admin():
-            default_tcp = {
-                "autotuninglevel": "normal",
-                "rss": "enabled",
-                "fastopen": "enabled",
-                "ecncapability": "enabled",
-            }
             tcp_values = (
-                backup["sysctl"] if (backup and "sysctl" in backup) else default_tcp
+                backup["sysctl"]
+                if (backup and "sysctl" in backup)
+                else _WINDOWS_TCP_DEFAULTS
             )
-            for key, val in default_tcp.items():
+            for key, val in _WINDOWS_TCP_DEFAULTS.items():
                 backup_val = tcp_values.get(key)
-                target_val = backup_val if backup_val else val
+                target_val = backup_val or val
                 try:
                     subprocess.run(
                         ["netsh", "int", "tcp", "set", "global", f"{key}={target_val}"],
@@ -1881,46 +1527,22 @@ def main():
         default=0.8,
         help="DNS query timeout in seconds.",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output structured JSON metrics.",
+    )
     args = parser.parse_args()
 
     interface = get_wifi_interface()
 
     if args.revert:
+        ensure_admin()
         revert_optimizations(interface)
         return
 
-    # Warm the airport JSON cache on macOS to prevent parallel system_profiler stampede
-    if OS_NAME == "Darwin":
-        _get_airport_json()
-
-    # Background: channel scan (independent of everything else)
-    scan_thread = threading.Thread(target=bg_scan_channels)
-    scan_thread.daemon = True
-    scan_thread.start()
-
-    print("=== Automated Wi-Fi Connection Analyzer & Optimizer ===")
-    print(f"Platform: {OS_NAME}")
-    if args.gaming:
-        print(
-            "[Gaming Mode] TCP delayed ACK disabled + system sleep disabled (Wi-Fi radio stays fully active)."
-        )
-
-    print(f"Interface: {interface}")
-
-    # 1. Retrieve Current Network Details
-    wifi_details = get_current_wifi_details(interface)
-    if wifi_details:
-        print("\n--- Active Wi-Fi Connection Link Parameters ---")
-        for k, v in wifi_details.items():
-            print(f"  {k:<15}: {v}")
-        print("------------------------------------------------")
-    else:
-        print("\n[Warning] Could not fetch connected Wi-Fi parameters.")
-
-    # 3. Run latency test and DNS benchmark in parallel.
-    # PMTU needs icmp_supported from latency, so it runs after latency completes
-    # but overlaps with whatever remains of the DNS benchmark.
-    print("\nRunning diagnostics in parallel (latency + DNS benchmark)...")
+    # Start non-privileged background diagnostics BEFORE sudo prompt so they execute
+    # in parallel while the user types their password.
     test_domains_list = [d.strip() for d in args.domains.split(",") if d.strip()]
     if not test_domains_list:
         test_domains_list = [
@@ -1930,117 +1552,134 @@ def main():
             "wikipedia.org",
         ]
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        lat_future = executor.submit(test_latency, args.ping_host)
-        dns_future = executor.submit(
-            benchmark_dns, interface, test_domains_list, args.dns_timeout
-        )
+    diag_executor = ThreadPoolExecutor(max_workers=4)
+    wifi_future = diag_executor.submit(get_current_wifi_details, interface)
+    lat_future = diag_executor.submit(test_latency, args.ping_host)
+    dns_future = diag_executor.submit(
+        benchmark_dns, interface, test_domains_list, args.dns_timeout
+    )
+    pmtu_future = diag_executor.submit(discover_pmtu, True, args.ping_host)
 
-        latency, icmp_supported = lat_future.result()
-        dns_results = dns_future.result()
+    ensure_admin()
 
-    print("\nMeasured connection latency:")
-    print_latency_results(latency)
+    # 1. Retrieve Current Network Details
+    wifi_details = wifi_future.result()
+
+    # 2. Collect diagnostic results (already completing/completed in background)
+    latency, icmp_supported = lat_future.result()
+    dns_results = dns_future.result()
+    raw_pmtu = pmtu_future.result()
+    diag_executor.shutdown(wait=False)
 
     fastest_dns = None
+    fallback_dns = None
     if dns_results:
-        print("\n--- DNS Resolver Speed Profile ---")
         sorted_dns = sorted(dns_results.items(), key=lambda x: x[1]["avg"])
-        for name, data in sorted_dns:
-            print(f"  {name:<25} ({data['ip']:<15}) : {data['avg']} ms")
         fastest_dns = sorted_dns[0]
-        print("----------------------------------")
+        if len(sorted_dns) > 1:
+            fallback_dns = sorted_dns[1]
 
-    # 4. Perform Path MTU Discovery (after icmp_supported is known)
-    print("")
-    pmtu = discover_pmtu(icmp_supported, args.ping_host)
+    # 3. Path MTU (pre-computed in background)
+    pmtu = raw_pmtu if icmp_supported else 1500
     if not pmtu:
         pmtu = 1500
 
-    # 5. Join background channel scan
-    scan_thread.join(timeout=3.0)
-    rec_24, rec_5, rec_6 = get_channel_recommendation(neighbor_channels)
-
-    # 6. Save backup before applying optimizations
+    # 4. Save backup before applying optimizations
     save_backup(interface)
 
-    # 7. Output Recommendations & Apply Optimizations
-    print("\n============================================================")
-    print("      AUTOMATED CONNECTION OPTIMIZATION REPORT & ACTION     ")
-    print("============================================================\n")
+    if args.json:
+        dns_ips = [fastest_dns[1]["ip"]] if fastest_dns else []
+        if fallback_dns:
+            dns_ips.append(fallback_dns[1]["ip"])
+        if dns_ips:
+            apply_dns(interface, dns_ips[0], dns_ips[1] if len(dns_ips) > 1 else None)
+        apply_mtu(interface, pmtu)
+        flush_dns_cache()
+        apply_sysctl_optimizations(gaming=args.gaming)
+        apply_power_save_optimization(interface, gaming=args.gaming)
+        if OS_NAME == "Windows":
+            set_windows_roaming_aggressiveness(interface, "2")
+        out = {
+            "platform": OS_NAME,
+            "interface": interface,
+            "wifi_details": wifi_details,
+            "latency": latency,
+            "dns_resolvers": dns_results,
+            "recommended_dns": dns_ips,
+            "recommended_mtu": pmtu,
+            "optimizations_applied": {
+                "dns": dns_ips,
+                "mtu": pmtu,
+                "dns_cache_flushed": True,
+                "sysctl_tuned": True,
+                "power_save_configured": True,
+            },
+        }
+        print(json.dumps(out, indent=2))
+        return
 
-    # 7a. Apply DNS
+    print(f"wifituner: Analyzing {interface} ({OS_NAME})")
+    if args.gaming:
+        print("note: Gaming mode active (disabled TCP delayed ACK and adapter sleep).")
+
+    if wifi_details:
+        print("\nActive Wi-Fi connection:")
+        for k, v in wifi_details.items():
+            print(f"  {k:<15}: {v}")
+    else:
+        print("\nwarning: Could not fetch active Wi-Fi link parameters.")
+
+    print()
+    print_latency_results(latency)
+
+    if dns_results:
+        print("\nDNS resolvers:")
+        for name, data in sorted_dns:
+            print(f"  {data['ip']:<15} {name:<25} {data['avg']} ms")
+
+    # 5. Output Recommendations & Apply Optimizations
+    print("\nApplying optimizations:")
+
+    # 5a. Apply DNS
     if fastest_dns:
-        dns_ip = fastest_dns[1]["ip"]
-        print(
-            f"[*] Recommended DNS Resolver: {dns_ip} ({fastest_dns[0]}) at {fastest_dns[1]['avg']} ms"
-        )
-        if apply_dns(interface, dns_ip):
-            if verify_dns(interface, dns_ip):
-                print("    DNS verified active.")
+        primary_ip = fastest_dns[1]["ip"]
+        fallback_ip = fallback_dns[1]["ip"] if fallback_dns else None
+        desc = f"  DNS         Set to {primary_ip} ({fastest_dns[0]}, {fastest_dns[1]['avg']} ms)"
+        if fallback_dns and fallback_ip:
+            desc += f" + {fallback_ip} ({fallback_dns[0]})"
+        print(desc)
+        if apply_dns(interface, primary_ip, fallback_ip):
+            if verify_dns(interface, primary_ip):
+                print("              DNS verified active.")
             else:
-                print("    Warning: DNS verification failed.")
-                if OS_NAME == "Darwin":
-                    service = get_macos_service_name(interface)
-                    print(
-                        f"    Revert: sudo networksetup -setdnsservers {service} empty"
-                    )
-                elif OS_NAME == "Linux":
-                    print(
-                        "    Revert: sudo resolvectl dns <interface> (or edit /etc/resolv.conf)"
-                    )
-                elif OS_NAME == "Windows":
-                    print(
-                        f"    Revert: netsh interface ipv4 set dns name={interface} dhcp"
-                    )
+                print("              warning: DNS verification failed.")
 
-    print("")
-    # 7b. Apply MTU
-    print(f"[*] Recommended MTU Size  : {pmtu} bytes")
+    # 5b. Apply MTU
+    print(f"  MTU         Set to {pmtu} bytes")
     apply_mtu(interface, pmtu)
 
-    print("")
-    # 7c. Flush cache
+    # 5c. Flush cache
     flush_dns_cache()
+    print("  Cache       Flushed system DNS cache")
 
-    print("")
-    # 7d. Apply kernel TCP stack tweaks
+    # 5d. Apply kernel TCP stack tweaks
     apply_sysctl_optimizations(gaming=args.gaming)
+    print("  Kernel      Tuned TCP/IP stack parameters")
 
-    # 7e. Apply Wi-Fi power-saving and roaming aggressiveness optimizations
+    # 5e. Apply Wi-Fi power-saving and roaming aggressiveness optimizations
     apply_power_save_optimization(interface, gaming=args.gaming)
+    print("  Power       Configured Wi-Fi power management")
     if OS_NAME == "Windows":
-        print("[*] Tuning Roaming Aggressiveness (setting to Medium-Low)...")
         set_windows_roaming_aggressiveness(interface, "2")
-
-    print("")
-    # 7f. Channel recommendations
-    print(
-        "[*] Wireless Channel Recommendations (Must adjust manually on your Access Point):"
-    )
-    print(
-        f"    - Cleanest 2.4 GHz Band : Channel {rec_24} (Occupied by {neighbor_channels['2GHz'].get(rec_24, 0)} neighbors)"
-    )
-    print(
-        f"    - Cleanest 5.0 GHz Band : Channel {rec_5} (Occupied by {neighbor_channels['5GHz'].get(rec_5, 0)} neighbors)"
-    )
-    if rec_6 is not None:
-        print(
-            f"    - Cleanest 6.0 GHz Band : Channel {rec_6} (Occupied by {neighbor_channels['6GHz'].get(rec_6, 0)} neighbors)"
-        )
+        print("  Roaming     Set roaming aggressiveness to Medium-Low")
 
     if wifi_details:
         sec = wifi_details.get("Security", "")
         if "Enterprise" in sec or "802.1X" in sec:
-            print("\n[Note] You are associated with an Enterprise Wi-Fi network.")
             print(
-                "       If custom DNS servers block local domain resolution or authentication,"
+                "\nnote: Associated with Enterprise Wi-Fi network. "
+                "Revert using 'python3 tuner.py --revert' if local auth is affected."
             )
-            print(
-                "       you can revert DNS to DHCP using standard OS network settings."
-            )
-
-    print("\n============================================================")
 
 
 if __name__ == "__main__":

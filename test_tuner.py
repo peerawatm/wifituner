@@ -1,13 +1,12 @@
-import json
 import unittest
-from unittest.mock import patch, MagicMock, mock_open
+from unittest.mock import MagicMock, mock_open, patch
+
 import tuner
 
 
 class TestTunerMultiPlatform(unittest.TestCase):
     def setUp(self):
         tuner.get_macos_service_name.cache_clear()
-        tuner._get_airport_json.cache_clear()
 
     # --- platform.system() and admin status ---
 
@@ -38,6 +37,14 @@ class TestTunerMultiPlatform(unittest.TestCase):
     def test_is_admin_linux_user(self, mock_geteuid, mock_system):
         tuner.OS_NAME = "Linux"
         self.assertFalse(tuner.is_admin())
+
+    @patch("platform.system", return_value="Darwin")
+    @patch("tuner.is_admin", return_value=False)
+    @patch("subprocess.run")
+    def test_ensure_admin_prompts_sudo(self, mock_run, mock_is_admin, mock_system):
+        tuner.OS_NAME = "Darwin"
+        tuner.ensure_admin()
+        mock_run.assert_called_once_with(["sudo", "-v"], check=True)
 
     # --- get_wifi_interface ---
 
@@ -152,7 +159,7 @@ class TestTunerMultiPlatform(unittest.TestCase):
         pmtu = tuner.discover_pmtu(icmp_supported=True, host="1.1.1.1")
         self.assertEqual(pmtu, 1500)
         mock_run.assert_any_call(
-            ["ping", "-M", "do", "-s", "1472", "-c", "2", "-W", "1", "1.1.1.1"],
+            ["ping", "-M", "do", "-s", "1472", "-c", "1", "-W", "1", "1.1.1.1"],
             capture_output=True,
             text=True,
             timeout=2.0,
@@ -169,156 +176,18 @@ class TestTunerMultiPlatform(unittest.TestCase):
         pmtu = tuner.discover_pmtu(icmp_supported=True, host="1.1.1.1")
         self.assertEqual(pmtu, 1500)
         mock_run.assert_any_call(
-            ["ping", "-f", "-l", "1472", "-n", "2", "-w", "1000", "1.1.1.1"],
+            ["ping", "-f", "-l", "1472", "-n", "1", "-w", "1000", "1.1.1.1"],
             capture_output=True,
             text=True,
             timeout=2.0,
         )
 
-    # --- scan_neighbor_channels ---
-
-    @patch("platform.system", return_value="Darwin")
-    @patch("subprocess.run")
-    def test_scan_neighbor_channels_macos_json(self, mock_run, mock_system):
-        """macOS JSON path: band parsed from channel string '6 (2GHz, 20MHz)'."""
-        tuner.OS_NAME = "Darwin"
-        payload = {
-            "SPAirPortDataType": [
-                {
-                    "spairport_airport_interfaces": [
-                        {
-                            "_name": "en0",
-                            "spairport_airport_other_local_wireless_networks": [
-                                {
-                                    "_name": "Net1",
-                                    "spairport_network_channel": "6 (2GHz, 20MHz)",
-                                },
-                                {
-                                    "_name": "Net2",
-                                    "spairport_network_channel": "1 (2GHz, 20MHz)",
-                                },
-                                {
-                                    "_name": "Net3",
-                                    "spairport_network_channel": "6 (2GHz, 20MHz)",
-                                },
-                                {
-                                    "_name": "Net4",
-                                    "spairport_network_channel": "36 (5GHz, 80MHz)",
-                                },
-                                {
-                                    "_name": "Net5",
-                                    "spairport_network_channel": "37 (6GHz, 80MHz)",
-                                },
-                            ],
-                        }
-                    ]
-                }
-            ]
-        }
-        mock_run.return_value = MagicMock(stdout=json.dumps(payload), returncode=0)
-        tuner._get_airport_json.cache_clear()
-        channels = tuner.scan_neighbor_channels()
-        self.assertEqual(channels["2GHz"].get("6"), 2)
-        self.assertEqual(channels["2GHz"].get("1"), 1)
-        self.assertEqual(channels["5GHz"].get("36"), 1)
-        self.assertEqual(channels["6GHz"].get("37"), 1)
-
-    @patch("platform.system", return_value="Linux")
-    @patch("subprocess.run")
-    def test_scan_neighbor_channels_linux(self, mock_run, mock_system):
-        """Linux nmcli path: uses CHAN,FREQ columns; GHz unit triggers × 1000 conversion."""
-        mock_result = MagicMock()
-        # nmcli -f CHAN,FREQ format (locale decimal: comma, unit: GHz)
-        mock_result.stdout = (
-            "CHAN  FREQ\n"
-            "1     2,412 GHz\n"
-            "6     2,437 GHz\n"
-            "1     2,412 GHz\n"
-            "36    5,180 GHz\n"
-        )
-        mock_result.returncode = 0
-        mock_run.return_value = mock_result
-        tuner.OS_NAME = "Linux"
-        channels = tuner.scan_neighbor_channels()
-        mock_run.assert_called_once_with(
-            ["nmcli", "-f", "CHAN,FREQ", "dev", "wifi", "list"],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(channels["2GHz"].get("1"), 2)
-        self.assertEqual(channels["2GHz"].get("6"), 1)
-        self.assertEqual(channels["5GHz"].get("36"), 1)
-        self.assertEqual(channels["6GHz"], {})
-
-    @patch("platform.system", return_value="Windows")
-    @patch("subprocess.run")
-    def test_scan_neighbor_channels_windows(self, mock_run, mock_system):
-        mock_result = MagicMock()
-        mock_result.stdout = (
-            "BSSID 1\n  Channel: 6\nBSSID 2\n  Channel: 11\nBSSID 3\n  Channel: 6"
-        )
-        mock_result.returncode = 0
-        mock_run.return_value = mock_result
-        tuner.OS_NAME = "Windows"
-        channels = tuner.scan_neighbor_channels()
-        self.assertEqual(channels["2GHz"].get("6"), 2)
-        self.assertEqual(channels["2GHz"].get("11"), 1)
-        self.assertEqual(channels["5GHz"], {})
-        self.assertEqual(channels["6GHz"], {})
-
-    # --- get_channel_recommendation ---
-
-    def test_get_channel_recommendation_no_6ghz(self):
-        """rec_6 is None when 6GHz band is empty."""
-        ch_by_band = {
-            "2GHz": {"1": 3, "6": 1, "11": 0},
-            "5GHz": {
-                "36": 2,
-                "40": 0,
-                "44": 3,
-                "48": 3,
-                "149": 3,
-                "153": 3,
-                "157": 3,
-                "161": 3,
-            },
-            "6GHz": {},
-        }
-        rec_24, rec_5, rec_6 = tuner.get_channel_recommendation(ch_by_band)
-        self.assertEqual(rec_24, "11")
-        self.assertEqual(rec_5, "40")
-        self.assertIsNone(rec_6)
-
-    def test_get_channel_recommendation_with_6ghz(self):
-        """rec_6 selects the PSC channel with fewest neighbors."""
-        c_6_psc = [
-            "5",
-            "21",
-            "37",
-            "53",
-            "69",
-            "85",
-            "101",
-            "117",
-            "133",
-            "149",
-            "165",
-            "181",
-            "197",
-            "213",
-            "229",
-        ]
-        # All PSC channels congested (2 each) except 181 (0)
-        ch_6 = {ch: (0 if ch == "181" else 2) for ch in c_6_psc}
-        ch_by_band = {"2GHz": {}, "5GHz": {}, "6GHz": ch_6}
-        _, _, rec_6 = tuner.get_channel_recommendation(ch_by_band)
-        self.assertEqual(rec_6, "181")
-
     # --- apply configurations ---
 
     @patch("platform.system", return_value="Linux")
+    @patch("tuner.verify_dns", return_value=False)
     @patch("subprocess.run")
-    def test_apply_dns_linux_resolvectl(self, mock_run, mock_system):
+    def test_apply_dns_linux_resolvectl(self, mock_run, mock_verify, mock_system):
         tuner.OS_NAME = "Linux"
         # First call checks version of resolvectl, second applies DNS
         mock_run.side_effect = [MagicMock(returncode=0), MagicMock(returncode=0)]
@@ -465,69 +334,14 @@ class TestTunerMultiPlatform(unittest.TestCase):
     # --- get_macos_wifi_details JSON path ---
 
     @patch("subprocess.run")
-    def test_get_macos_wifi_details_json(self, mock_run):
-        tuner.OS_NAME = "Darwin"
-        # Payload uses the correct key names as returned by macOS system_profiler.
-        payload = {
-            "SPAirPortDataType": [
-                {
-                    "spairport_airport_interfaces": [
-                        {
-                            "_name": "en0",
-                            "spairport_current_network_information": {
-                                "_name": "TestNet",
-                                "spairport_network_channel": "6 (2GHz, 20MHz)",
-                                "spairport_network_phymode": "802.11ax",
-                                "spairport_signal_noise": "-55 dBm / -92 dBm",
-                                "spairport_security_mode": "WPA2 Personal",
-                                "spairport_network_rate": 300,
-                            },
-                        }
-                    ]
-                }
-            ]
-        }
-        mock_run.return_value = MagicMock(stdout=json.dumps(payload), returncode=0)
-        details = tuner.get_macos_wifi_details()
+    def test_get_macos_wifi_details(self, mock_run):
+        mock_result = MagicMock()
+        mock_result.stdout = "SSID : TestNet\nSecurity : WPA2\n"
+        mock_result.returncode = 0
+        mock_run.return_value = mock_result
+        details = tuner.get_macos_wifi_details("en0")
         self.assertEqual(details["SSID"], "TestNet")
-        self.assertEqual(details["Channel"], "6 (2GHz, 20MHz)")
-        self.assertEqual(details["PHY Mode"], "802.11ax")
-        self.assertEqual(details["RSSI"], "-55 dBm")
-        self.assertEqual(details["Noise"], "-92 dBm")
-        self.assertEqual(details["SNR"], "37 dB")
-        self.assertEqual(details["Transmit Rate"], "300 Mbps")
-
-    # --- _parse_channel_band ---
-
-    def test_parse_channel_band_5ghz(self):
-        ch, band, width = tuner._parse_channel_band("64 (5GHz, 80MHz)")
-        self.assertEqual(ch, "64")
-        self.assertEqual(band, "5GHz")
-        self.assertEqual(width, 80)
-
-    def test_parse_channel_band_2ghz(self):
-        ch, band, width = tuner._parse_channel_band("6 (2GHz, 20MHz)")
-        self.assertEqual(ch, "6")
-        self.assertEqual(band, "2GHz")
-        self.assertEqual(width, 20)
-
-    def test_parse_channel_band_6ghz(self):
-        ch, band, width = tuner._parse_channel_band("37 (6GHz, 80MHz)")
-        self.assertEqual(ch, "37")
-        self.assertEqual(band, "6GHz")
-        self.assertEqual(width, 80)
-
-    def test_parse_channel_band_plain_int(self):
-        ch, band, width = tuner._parse_channel_band("64")
-        self.assertEqual(ch, "64")
-        self.assertIsNone(band)
-        self.assertEqual(width, 20)
-
-    def test_parse_channel_band_empty(self):
-        ch, band, width = tuner._parse_channel_band("")
-        self.assertIsNone(ch)
-        self.assertIsNone(band)
-        self.assertEqual(width, 20)
+        self.assertEqual(details["Security"], "WPA2")
 
     # --- _persist_sysctl ---
 
@@ -699,14 +513,15 @@ class TestTunerMultiPlatform(unittest.TestCase):
         )
 
     @patch("platform.system", return_value="FreeBSD")
+    @patch("tuner.verify_dns", return_value=False)
     @patch("subprocess.run")
-    def test_apply_dns_bsd(self, mock_run, mock_system):
+    def test_apply_dns_bsd(self, mock_run, mock_verify, mock_system):
         tuner.OS_NAME = "FreeBSD"
         tuner.IS_BSD = True
         mock_run.return_value = MagicMock(returncode=0)
         self.assertTrue(tuner.apply_dns("wlan0", "1.1.1.1"))
         mock_run.assert_called_with(
-            ["sudo", "sh", "-c", "echo 'nameserver 1.1.1.1' > /etc/resolv.conf"],
+            ["sudo", "sh", "-c", "printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf"],
             check=True,
         )
 

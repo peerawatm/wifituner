@@ -2,35 +2,23 @@
 
 python := if os() == "windows" { "python" } else { "python3" }
 
-# List available recipes
-default:
-    @just --list
+default: run
 
 # Run wifituner analyzer & optimizer
 run *args="":
     {{ python }} tuner.py {{ args }}
 
-# Run multi-platform unit tests
+# Run all test suites & static quality checks (unittest, format check, Pyflakes, Simplify, Bugbear, PyUpgrade, Comprehensions, Builtins, Pie, Return, Mypy)
 test *args="":
     {{ python }} -m unittest test_tuner.py {{ args }}
-
-# Format source code using Ruff
-format:
-    uvx ruff format tuner.py test_tuner.py
-
-# Lint source code using Ruff
-lint:
-    uvx ruff check tuner.py test_tuner.py
-
-# Typecheck code using Mypy
-typecheck:
+    uvx ruff format --check tuner.py test_tuner.py
+    uvx ruff check --select F,SIM,B,UP,C4,A,PIE,RET,I,N,FURB tuner.py test_tuner.py
     uvx mypy --check-untyped-defs tuner.py
 
 # Remove build caches and temporary files
 [unix]
 clean:
     rm -rf __pycache__ .mypy_cache .ruff_cache .pytest_cache .coverage .coverage.* htmlcov
-    find . -name "*.pyc" -delete
 
 [windows]
 clean:
