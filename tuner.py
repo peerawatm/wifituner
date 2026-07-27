@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__version__ = "1.1.0"
+__version__ = "2.2.0"
 import argparse
 import asyncio
 import contextlib
@@ -13,8 +13,10 @@ import socket
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 OS_NAME = platform.system()
+
 
 def is_bsd() -> bool:
     return OS_NAME.endswith("BSD") or "BSD" in OS_NAME
@@ -91,7 +93,7 @@ def _warn(msg: str) -> None:
 
 
 def _cmd(args, timeout: float | None = None, check: bool = False) -> str | None:
-    kwargs = {"capture_output": True, "text": True}
+    kwargs: dict[str, Any] = {"capture_output": True, "text": True}
     if check:
         kwargs["check"] = True
     if timeout is not None:
@@ -104,7 +106,7 @@ def _cmd(args, timeout: float | None = None, check: bool = False) -> str | None:
 
 
 def _run_ok(args, timeout: float | None = None, capture_output: bool = True) -> bool:
-    kwargs = {"check": True}
+    kwargs: dict[str, Any] = {"check": True}
     if capture_output:
         kwargs["capture_output"] = True
     if timeout is not None:
@@ -146,7 +148,11 @@ def get_wifi_interface():
     if OS_NAME == "Darwin":
         res = _cmd(["networksetup", "-listallhardwareports"], check=True)
         if res:
-            match = re.search(r"Hardware Port:\s*Wi-Fi\s*\nDevice:\s*([a-zA-Z0-9]+)", res, re.MULTILINE)
+            match = re.search(
+                r"Hardware Port:\s*Wi-Fi\s*\nDevice:\s*([a-zA-Z0-9]+)",
+                res,
+                re.MULTILINE,
+            )
             if match:
                 return match.group(1)
         return "en0"
@@ -158,8 +164,18 @@ def get_wifi_interface():
                 if part.startswith("wlan"):
                     return part
             wifi_prefixes = (
-                "iwn", "ath", "wpi", "run", "ral", "rsu",
-                "rtwn", "malo", "otus", "urtwn", "pgt", "bwn",
+                "iwn",
+                "ath",
+                "wpi",
+                "run",
+                "ral",
+                "rsu",
+                "rtwn",
+                "malo",
+                "otus",
+                "urtwn",
+                "pgt",
+                "bwn",
             )
             for part in parts:
                 if any(part.startswith(p) for p in wifi_prefixes):
@@ -176,6 +192,11 @@ def get_wifi_interface():
             for d in os.listdir("/sys/class/net"):
                 if os.path.exists(f"/sys/class/net/{d}/wireless") or os.path.exists(
                     f"/sys/class/net/{d}/phy80211"
+                ):
+                    return d
+            for d in sorted(os.listdir("/sys/class/net")):
+                if d != "lo" and not d.startswith(
+                    ("docker", "veth", "br-", "virbr", "tun", "tap")
                 ):
                     return d
         except Exception:
@@ -250,7 +271,16 @@ def get_windows_wifi_details():
             details["Security"] = v
         elif any(x in k for x in ("signal", "señal", "segnale")):
             details["RSSI"] = v
-        elif any(x in k for x in ("transmit", "transmission", "übertrag", "velocidad de trans", "velocità di trans")):
+        elif any(
+            x in k
+            for x in (
+                "transmit",
+                "transmission",
+                "übertrag",
+                "velocidad de trans",
+                "velocità di trans",
+            )
+        ):
             details["Transmit Rate"] = f"{v} Mbps" if "mbps" not in v.lower() else v
     return details
 
@@ -267,7 +297,15 @@ def get_linux_wifi_details(interface):
                 freq_mhz = s.split("freq:", 1)[1].strip()
                 try:
                     freq = int(freq_mhz)
-                    band = "6GHz" if freq >= 5925 else "5GHz" if freq >= 5000 else "2.4GHz" if freq >= 2400 else None
+                    band = (
+                        "6GHz"
+                        if freq >= 5925
+                        else "5GHz"
+                        if freq >= 5000
+                        else "2.4GHz"
+                        if freq >= 2400
+                        else None
+                    )
                     details["Channel"] = f"{freq} MHz ({band})" if band else freq_mhz
                 except ValueError:
                     details["Channel"] = freq_mhz
@@ -306,7 +344,11 @@ def get_bsd_wifi_details(interface: str) -> dict[str, str]:
     details: dict[str, str] = {}
     res = _cmd(["ifconfig", interface])
     if res:
-        for pat, key in [(r"\bssid\s+([^\s]+)", "SSID"), (r"\bchannel\s+(\d+)", "Channel"), (r"\bbssid\s+([0-9a-fA-F:]+)", "BSSID")]:
+        for pat, key in [
+            (r"\bssid\s+([^\s]+)", "SSID"),
+            (r"\bchannel\s+(\d+)", "Channel"),
+            (r"\bbssid\s+([0-9a-fA-F:]+)", "BSSID"),
+        ]:
             m = re.search(pat, res)
             if m:
                 details[key] = m.group(1)
@@ -774,16 +816,27 @@ def apply_mtu(interface, mtu_size):
 
 def flush_dns_cache():
     if OS_NAME == "Darwin":
-        if not (_run_ok(["sudo", "dscacheutil", "-flushcache"], capture_output=False) and _run_ok(["sudo", "killall", "-HUP", "mDNSResponder"], capture_output=False)):
+        if not (
+            _run_ok(["sudo", "dscacheutil", "-flushcache"], capture_output=False)
+            and _run_ok(
+                ["sudo", "killall", "-HUP", "mDNSResponder"], capture_output=False
+            )
+        ):
             _warn("DNS cache flush failed (dscacheutil/mDNSResponder).")
     elif OS_NAME == "Linux":
-        if not (_run_ok(["sudo", "resolvectl", "flush-caches"], capture_output=False) or _run_ok(["sudo", "systemd-resolve", "--flush-caches"], capture_output=False)):
+        if not (
+            _run_ok(["sudo", "resolvectl", "flush-caches"], capture_output=False)
+            or _run_ok(
+                ["sudo", "systemd-resolve", "--flush-caches"], capture_output=False
+            )
+        ):
             _warn(
                 "DNS cache flush failed (resolvectl and systemd-resolve both unavailable)."
             )
-    elif OS_NAME == "Windows":
-        if not _run_ok(["ipconfig", "/flushdns"], capture_output=False):
-            _warn("DNS cache flush failed (ipconfig /flushdns).")
+    elif OS_NAME == "Windows" and not _run_ok(
+        ["ipconfig", "/flushdns"], capture_output=False
+    ):
+        _warn("DNS cache flush failed (ipconfig /flushdns).")
 
 
 # Persist sysctl settings to config file so they survive reboots.
@@ -824,9 +877,7 @@ def _persist_sysctl_dict(kv_dict: dict[str, str]) -> None:
 def _apply_sysctl_dict(optimizations: dict[str, str]) -> None:
     _persist_sysctl_dict(optimizations)
     if OS_NAME in ("Darwin", "Linux") or is_bsd():
-        cmd = ["sudo", "sysctl", "-w"] + [
-            f"{k}={v}" for k, v in optimizations.items()
-        ]
+        cmd = ["sudo", "sysctl", "-w"] + [f"{k}={v}" for k, v in optimizations.items()]
         if not _run_ok(cmd):
             _warn("Failed to apply sysctl batch.")
 
@@ -865,10 +916,8 @@ def apply_sysctl_optimizations(gaming=False):
 
 def apply_power_save_optimization(interface: str, gaming: bool = False) -> bool:
     if OS_NAME == "Darwin":
-        if gaming and _run_ok(["sudo", "pmset", "-a", "sleep", "0"]):
-            return True
-        return False
-    elif OS_NAME == "Linux":
+        return bool(gaming and _run_ok(["sudo", "pmset", "-a", "sleep", "0"]))
+    if OS_NAME == "Linux":
         if _run_ok(["sudo", "iw", "dev", interface, "set", "power_save", "off"]):
             print("    Wi-Fi power saving disabled.")
             return True
@@ -1274,7 +1323,9 @@ def main():
 
     # Start non-privileged background diagnostics BEFORE sudo prompt so they execute
     # in parallel while the user types their password.
-    test_domains_list = [d.strip() for d in args.domains.split(",") if d.strip()] or None
+    test_domains_list = [
+        d.strip() for d in args.domains.split(",") if d.strip()
+    ] or None
 
     diag_executor = ThreadPoolExecutor(max_workers=4)
     wifi_future = diag_executor.submit(get_current_wifi_details, interface)
@@ -1298,10 +1349,18 @@ def main():
     fastest_dns = None
     fallback_dns = None
     if dns_results:
-        sorted_dns = sorted(dns_results.items(), key=lambda x: x[1]["avg"])
-        fastest_dns = sorted_dns[0]
-        if len(sorted_dns) > 1:
-            fallback_dns = sorted_dns[1]
+        valid_dns = [
+            item
+            for item in dns_results.items()
+            if not (
+                item[1]["ip"].startswith("127.") or item[1]["ip"] in ("::1", "0.0.0.0")
+            )
+        ]
+        sorted_dns = sorted(valid_dns, key=lambda x: x[1]["avg"])
+        if sorted_dns:
+            fastest_dns = sorted_dns[0]
+            if len(sorted_dns) > 1:
+                fallback_dns = sorted_dns[1]
 
     # 3. Path MTU (pre-computed in background)
     pmtu = raw_pmtu if icmp_supported else 1500
