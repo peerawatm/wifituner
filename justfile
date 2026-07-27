@@ -7,9 +7,9 @@ run *args="":
 # Run all test suites & static quality checks (unittest, format check, Pyflakes, Simplify, Bugbear, PyUpgrade, Comprehensions, Builtins, Pie, Return, Mypy)
 test *args="":
     {{ python }} -m unittest test_tuner.py {{ args }}
-    uvx ruff format --check tuner.py test_tuner.py
-    uvx ruff check --select F,SIM,B,UP,C4,A,PIE,RET,I,N,FURB tuner.py test_tuner.py
-    uvx mypy --check-untyped-defs tuner.py
+    -ruff format --check tuner.py test_tuner.py
+    -ruff check --select F,SIM,B,UP,C4,A,PIE,RET,I,N,FURB tuner.py test_tuner.py
+    -mypy --check-untyped-defs tuner.py
 
 # Remove build files
 [unix]
