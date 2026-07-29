@@ -1,3 +1,4 @@
+import subprocess
 import unittest
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -509,6 +510,103 @@ class TestTunerMultiPlatform(unittest.TestCase):
         self.assertEqual(query[-5:], b"\x00\x00\x01\x00\x01")
         self.assertIn(b"example", query)
         self.assertIn(b"com", query)
+
+    # --- daemon install / uninstall ---
+
+    def test_build_sysctl_args(self):
+        result = tuner._build_sysctl_args({"a": "1", "b": "2"})
+        self.assertEqual(result, ["sysctl", "-w", "a=1", "b=2"])
+
+    def test_build_launchd_plist(self):
+        import plistlib
+
+        data = tuner._build_launchd_plist(
+            ["/usr/sbin/sysctl", "-w", "net.inet.tcp.mssdflt=1460"],
+            label="com.test.sysctl",
+        )
+        parsed = plistlib.loads(data)
+        self.assertEqual(parsed["Label"], "com.test.sysctl")
+        self.assertTrue(parsed["RunAtLoad"])
+        self.assertIn("/usr/sbin/sysctl", parsed["ProgramArguments"])
+
+    def test_build_systemd_unit(self):
+        unit = tuner._build_systemd_unit("/usr/sbin/sysctl -w foo=1")
+        self.assertIn("[Unit]", unit)
+        self.assertIn("Type=oneshot", unit)
+        self.assertIn("ExecStart=/usr/sbin/sysctl -w foo=1", unit)
+        self.assertIn("WantedBy=multi-user.target", unit)
+
+    @patch("subprocess.run")
+    def test_install_daemon_darwin(self, mock_run):
+        tuner.OS_NAME = "Darwin"
+        mock_run.return_value = MagicMock(returncode=0)
+        result = tuner.install_daemon(gaming=True)
+        self.assertTrue(result)
+        # Verify plist was written via sudo python3
+        write_call = mock_run.call_args_list[0]
+        self.assertEqual(write_call[0][0][:3], ["sudo", "python3", "-c"])
+        # Verify launchctl load was called
+        launchctl_calls = [
+            c
+            for c in mock_run.call_args_list
+            if len(c[0][0]) >= 3 and c[0][0][:2] == ["sudo", "launchctl"]
+        ]
+        load_calls = [c for c in launchctl_calls if "load" in c[0][0]]
+        self.assertTrue(len(load_calls) >= 1)
+
+    @patch("subprocess.run")
+    @patch("os.path.exists", return_value=True)
+    def test_install_daemon_linux(self, mock_exists, mock_run):
+        tuner.OS_NAME = "Linux"
+        mock_run.return_value = MagicMock(returncode=0)
+        result = tuner.install_daemon()
+        self.assertTrue(result)
+        # Verify systemd unit was written
+        write_call = mock_run.call_args_list[0]
+        self.assertEqual(write_call[0][0][:2], ["sudo", "python3"])
+
+    @patch("subprocess.run")
+    def test_install_daemon_write_failure(self, mock_run):
+        tuner.OS_NAME = "Darwin"
+        mock_run.side_effect = [
+            subprocess.CalledProcessError(1, "sudo python3 -c ..."),
+        ]
+        result = tuner.install_daemon()
+        self.assertFalse(result)
+
+    @patch("subprocess.run")
+    @patch.object(tuner._LAUNCHD_PLIST_PATH.__class__, "exists", return_value=True)
+    def test_uninstall_daemon_darwin(self, mock_exists, mock_run):
+        tuner.OS_NAME = "Darwin"
+        mock_run.return_value = MagicMock(returncode=0)
+        result = tuner.uninstall_daemon()
+        self.assertTrue(result)
+
+    @patch("subprocess.run")
+    @patch.object(tuner._LAUNCHD_PLIST_PATH.__class__, "exists", return_value=False)
+    def test_uninstall_daemon_darwin_noop(self, mock_exists, mock_run):
+        tuner.OS_NAME = "Darwin"
+        result = tuner.uninstall_daemon()
+        self.assertTrue(result)
+        mock_run.assert_not_called()
+
+    @patch("subprocess.run")
+    @patch.object(tuner._SYSTEMD_SERVICE_PATH.__class__, "exists", return_value=True)
+    def test_uninstall_daemon_linux(self, mock_exists, mock_run):
+        tuner.OS_NAME = "Linux"
+        mock_run.return_value = MagicMock(returncode=0)
+        result = tuner.uninstall_daemon()
+        self.assertTrue(result)
+
+    def test_install_daemon_unsupported_os(self):
+        tuner.OS_NAME = "Windows"
+        result = tuner.install_daemon()
+        self.assertFalse(result)
+
+    def test_uninstall_daemon_unsupported_os(self):
+        tuner.OS_NAME = "Windows"
+        result = tuner.uninstall_daemon()
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":

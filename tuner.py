@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 import argparse
 import asyncio
 import contextlib
 import functools
 import json
 import os
+import plistlib
 import platform
 import random
 import re
 import socket
 import subprocess
+import sys
+import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 OS_NAME = platform.system()
@@ -78,6 +82,152 @@ _BSD_SYSCTL_DEFAULTS = {
 _BSD_SYSCTL_OPTIMIZATIONS = {
     "net.inet.tcp.mssdflt": "1460",
 }
+
+# --- Daemon / service constants ---
+
+_DAEMON_LABEL = "com.wifituner.sysctl"
+_LAUNCHD_PLIST_PATH = Path(f"/Library/LaunchDaemons/{_DAEMON_LABEL}.plist")
+_SYSTEMD_SERVICE_NAME = "wifituner-sysctl.service"
+_SYSTEMD_SERVICE_PATH = Path(f"/etc/systemd/system/{_SYSTEMD_SERVICE_NAME}")
+
+
+def _build_sysctl_args(kv: dict[str, str]) -> list[str]:
+    """Return ['sysctl', '-w', 'k1=v1', 'k2=v2', ...]."""
+    return ["sysctl", "-w"] + [f"{k}={v}" for k, v in kv.items()]
+
+
+def _build_launchd_plist(program_arguments: list[str], label: str = _DAEMON_LABEL) -> bytes:
+    """Return XML plist bytes for a macOS LaunchDaemon."""
+    plist_dict = {
+        "Label": label,
+        "ProgramArguments": program_arguments,
+        "RunAtLoad": True,
+    }
+    return plistlib.dumps(plist_dict, fmt=plistlib.FMT_XML)
+
+
+def _build_systemd_unit(exec_start: str) -> str:
+    """Return a systemd oneshot unit file that runs *exec_start* at boot."""
+    return textwrap.dedent(f"""\
+        [Unit]
+        Description=wifituner sysctl optimizations
+        After=network-pre.target
+
+        [Service]
+        Type=oneshot
+        ExecStart={exec_start}
+        RemainAfterExit=yes
+
+        [Install]
+        WantedBy=multi-user.target
+    """)
+
+
+def install_daemon(gaming: bool = False) -> bool:
+    """Install a boot-time daemon/service that re-applies sysctl optimizations.
+
+    macOS: writes a LaunchDaemon plist to /Library/LaunchDaemons/.
+    Linux: writes a systemd oneshot service and enables it.
+    """
+    if OS_NAME == "Darwin":
+        optimizations = dict(_MACOS_SYSCTL_OPTIMIZATIONS)
+        if gaming:
+            optimizations["net.inet.tcp.delayed_ack"] = "0"
+        args = _build_sysctl_args(optimizations)
+        # sysctl lives at /usr/sbin/sysctl on macOS
+        args[0] = "/usr/sbin/sysctl"
+        plist_bytes = _build_launchd_plist(args)
+        plist_path = str(_LAUNCHD_PLIST_PATH)
+        # Write via sudo python3 to avoid shell-quoting issues with binary data.
+        write_script = (
+            f"import sys; open({plist_path!r}, 'wb').write(sys.stdin.buffer.read())"
+        )
+        try:
+            subprocess.run(
+                ["sudo", "python3", "-c", write_script],
+                input=plist_bytes,
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            _warn(f"Failed to write plist to {plist_path}: {e}")
+            return False
+        # Set ownership and permissions
+        _run_ok(["sudo", "chown", "root:wheel", plist_path])
+        _run_ok(["sudo", "chmod", "644", plist_path])
+        # Load the daemon
+        # Unload first in case it is already loaded (ignore errors).
+        _run_ok(["sudo", "launchctl", "unload", plist_path])
+        if not _run_ok(["sudo", "launchctl", "load", plist_path]):
+            _warn(f"Failed to load daemon {_DAEMON_LABEL}.")
+            return False
+        print(f"Installed LaunchDaemon: {plist_path}")
+        print(f"Daemon {_DAEMON_LABEL} is loaded and will run at every boot.")
+        return True
+
+    if OS_NAME == "Linux":
+        sysctl_bin = "/usr/sbin/sysctl"
+        if not os.path.exists(sysctl_bin):
+            sysctl_bin = "/sbin/sysctl"
+        optimizations = dict(_LINUX_SYSCTL_OPTIMIZATIONS)
+        args_str = " ".join(f"{k}={v}" for k, v in optimizations.items())
+        exec_start = f"{sysctl_bin} -w {args_str}"
+        unit_content = _build_systemd_unit(exec_start)
+        service_path = str(_SYSTEMD_SERVICE_PATH)
+        write_script = f"open({service_path!r}, 'w').write(sys.stdin.read())"
+        try:
+            subprocess.run(
+                ["sudo", "python3", "-c", f"import sys; {write_script}"],
+                input=unit_content,
+                text=True,
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            _warn(f"Failed to write systemd unit to {service_path}: {e}")
+            return False
+        _run_ok(["sudo", "systemctl", "daemon-reload"])
+        if not _run_ok(["sudo", "systemctl", "enable", _SYSTEMD_SERVICE_NAME]):
+            _warn(f"Failed to enable {_SYSTEMD_SERVICE_NAME}.")
+            return False
+        print(f"Installed systemd service: {service_path}")
+        print(f"Service {_SYSTEMD_SERVICE_NAME} is enabled and will run at every boot.")
+        return True
+
+    _warn(f"Daemon installation is not supported on {OS_NAME}.")
+    return False
+
+
+def uninstall_daemon() -> bool:
+    """Remove the boot-time daemon/service installed by install_daemon."""
+    if OS_NAME == "Darwin":
+        plist_path = str(_LAUNCHD_PLIST_PATH)
+        if not _LAUNCHD_PLIST_PATH.exists():
+            print(f"No daemon found at {plist_path}. Nothing to uninstall.")
+            return True
+        _run_ok(["sudo", "launchctl", "unload", plist_path])
+        if not _run_ok(["sudo", "rm", "-f", plist_path]):
+            _warn(f"Failed to remove {plist_path}.")
+            return False
+        print(f"Uninstalled LaunchDaemon: {plist_path}")
+        return True
+
+    if OS_NAME == "Linux":
+        service_path = str(_SYSTEMD_SERVICE_PATH)
+        if not _SYSTEMD_SERVICE_PATH.exists():
+            print(f"No service found at {service_path}. Nothing to uninstall.")
+            return True
+        _run_ok(["sudo", "systemctl", "disable", _SYSTEMD_SERVICE_NAME])
+        if not _run_ok(["sudo", "rm", "-f", service_path]):
+            _warn(f"Failed to remove {service_path}.")
+            return False
+        _run_ok(["sudo", "systemctl", "daemon-reload"])
+        print(f"Uninstalled systemd service: {service_path}")
+        return True
+
+    _warn(f"Daemon uninstallation is not supported on {OS_NAME}.")
+    return False
+
 
 _WINDOWS_TCP_DEFAULTS = {
     "autotuninglevel": "normal",
@@ -1290,6 +1440,16 @@ def main():
         help="Undo all applied changes and restore system defaults.",
     )
     parser.add_argument(
+        "--install-daemon",
+        action="store_true",
+        help="Install a LaunchDaemon (macOS) or systemd service (Linux) to persist sysctl optimizations across reboots.",
+    )
+    parser.add_argument(
+        "--uninstall-daemon",
+        action="store_true",
+        help="Remove the boot-time daemon/service created by --install-daemon.",
+    )
+    parser.add_argument(
         "--domains",
         type=str,
         default="google.com,cloudflare.com,github.com,wikipedia.org",
@@ -1320,6 +1480,16 @@ def main():
         ensure_admin()
         revert_optimizations(interface)
         return
+
+    if args.install_daemon:
+        ensure_admin()
+        ok = install_daemon(gaming=args.gaming)
+        sys.exit(0 if ok else 1)
+
+    if args.uninstall_daemon:
+        ensure_admin()
+        ok = uninstall_daemon()
+        sys.exit(0 if ok else 1)
 
     # Start non-privileged background diagnostics BEFORE sudo prompt so they execute
     # in parallel while the user types their password.
