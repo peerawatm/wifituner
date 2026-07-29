@@ -608,6 +608,36 @@ class TestTunerMultiPlatform(unittest.TestCase):
         result = tuner.uninstall_daemon()
         self.assertFalse(result)
 
+    # --- AWDL tests ---
+
+    @patch("platform.system", return_value="Darwin")
+    @patch("tuner._cmd")
+    def test_get_macos_awdl_status(self, mock_cmd, mock_system):
+        tuner.OS_NAME = "Darwin"
+        mock_cmd.side_effect = lambda args, timeout=None: (
+            "awdl0: flags=8843<UP,BROADCAST,RUNNING>\n" if "awdl0" in args else "llw0: flags=8822<BROADCAST>\n"
+        )
+        status = tuner.get_macos_awdl_status()
+        self.assertTrue(status["awdl0"])
+        self.assertFalse(status["llw0"])
+
+    @patch("platform.system", return_value="Darwin")
+    @patch("tuner._cmd", return_value="awdl0: flags=8843<UP>\n")
+    @patch("tuner._run_ok", return_value=True)
+    def test_set_macos_awdl(self, mock_run_ok, mock_cmd, mock_system):
+        tuner.OS_NAME = "Darwin"
+        res = tuner.set_macos_awdl(False)
+        self.assertTrue(res)
+        mock_run_ok.assert_any_call(["sudo", "ifconfig", "awdl0", "down"])
+        mock_run_ok.assert_any_call(["sudo", "ifconfig", "llw0", "down"])
+
+    @patch("subprocess.run")
+    def test_install_daemon_darwin_with_awdl(self, mock_run):
+        tuner.OS_NAME = "Darwin"
+        mock_run.return_value = MagicMock(returncode=0)
+        result = tuner.install_daemon(disable_awdl=True)
+        self.assertTrue(result)
+
 
 if __name__ == "__main__":
     unittest.main()

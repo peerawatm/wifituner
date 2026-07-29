@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 import argparse
 import asyncio
 import contextlib
@@ -96,13 +96,19 @@ def _build_sysctl_args(kv: dict[str, str]) -> list[str]:
     return ["sysctl", "-w"] + [f"{k}={v}" for k, v in kv.items()]
 
 
-def _build_launchd_plist(program_arguments: list[str], label: str = _DAEMON_LABEL) -> bytes:
+def _build_launchd_plist(
+    program_arguments: list[str],
+    label: str = _DAEMON_LABEL,
+    start_interval: int | None = None,
+) -> bytes:
     """Return XML plist bytes for a macOS LaunchDaemon."""
-    plist_dict = {
+    plist_dict: dict[str, Any] = {
         "Label": label,
         "ProgramArguments": program_arguments,
         "RunAtLoad": True,
     }
+    if start_interval is not None:
+        plist_dict["StartInterval"] = start_interval
     return plistlib.dumps(plist_dict, fmt=plistlib.FMT_XML)
 
 
@@ -123,7 +129,7 @@ def _build_systemd_unit(exec_start: str) -> str:
     """)
 
 
-def install_daemon(gaming: bool = False) -> bool:
+def install_daemon(gaming: bool = False, disable_awdl: bool = False) -> bool:
     """Install a boot-time daemon/service that re-applies sysctl optimizations.
 
     macOS: writes a LaunchDaemon plist to /Library/LaunchDaemons/.
@@ -133,24 +139,23 @@ def install_daemon(gaming: bool = False) -> bool:
         optimizations = dict(_MACOS_SYSCTL_OPTIMIZATIONS)
         if gaming:
             optimizations["net.inet.tcp.delayed_ack"] = "0"
-        args = _build_sysctl_args(optimizations)
-        # sysctl lives at /usr/sbin/sysctl on macOS
-        args[0] = "/usr/sbin/sysctl"
-        plist_bytes = _build_launchd_plist(args)
-        plist_path = str(_LAUNCHD_PLIST_PATH)
-        # Write via sudo python3 to avoid shell-quoting issues with binary data.
-        write_script = (
-            f"import sys; open({plist_path!r}, 'wb').write(sys.stdin.buffer.read())"
-        )
-        try:
-            subprocess.run(
-                ["sudo", "python3", "-c", write_script],
-                input=plist_bytes,
-                check=True,
-                capture_output=True,
+        should_disable_awdl = disable_awdl or gaming
+        if should_disable_awdl:
+            sysctl_cmd = " ".join(f"{k}={v}" for k, v in optimizations.items())
+            cmd_str = (
+                f"/usr/sbin/sysctl -w {sysctl_cmd}; "
+                "/sbin/ifconfig awdl0 down 2>/dev/null; "
+                "/sbin/ifconfig llw0 down 2>/dev/null"
             )
-        except subprocess.CalledProcessError as e:
-            _warn(f"Failed to write plist to {plist_path}: {e}")
+            args = ["/bin/sh", "-c", cmd_str]
+            plist_bytes = _build_launchd_plist(args, start_interval=60)
+        else:
+            args = _build_sysctl_args(optimizations)
+            args[0] = "/usr/sbin/sysctl"
+            plist_bytes = _build_launchd_plist(args)
+        plist_path = str(_LAUNCHD_PLIST_PATH)
+        if not _sudo_write_file(plist_path, plist_bytes):
+            _warn(f"Failed to write plist to {plist_path}.")
             return False
         # Set ownership and permissions
         _run_ok(["sudo", "chown", "root:wheel", plist_path])
@@ -166,25 +171,14 @@ def install_daemon(gaming: bool = False) -> bool:
         return True
 
     if OS_NAME == "Linux":
-        sysctl_bin = "/usr/sbin/sysctl"
-        if not os.path.exists(sysctl_bin):
-            sysctl_bin = "/sbin/sysctl"
+        sysctl_bin = "/usr/sbin/sysctl" if os.path.exists("/usr/sbin/sysctl") else "/sbin/sysctl"
         optimizations = dict(_LINUX_SYSCTL_OPTIMIZATIONS)
         args_str = " ".join(f"{k}={v}" for k, v in optimizations.items())
         exec_start = f"{sysctl_bin} -w {args_str}"
         unit_content = _build_systemd_unit(exec_start)
         service_path = str(_SYSTEMD_SERVICE_PATH)
-        write_script = f"open({service_path!r}, 'w').write(sys.stdin.read())"
-        try:
-            subprocess.run(
-                ["sudo", "python3", "-c", f"import sys; {write_script}"],
-                input=unit_content,
-                text=True,
-                check=True,
-                capture_output=True,
-            )
-        except subprocess.CalledProcessError as e:
-            _warn(f"Failed to write systemd unit to {service_path}: {e}")
+        if not _sudo_write_file(service_path, unit_content):
+            _warn(f"Failed to write systemd unit to {service_path}.")
             return False
         _run_ok(["sudo", "systemctl", "daemon-reload"])
         if not _run_ok(["sudo", "systemctl", "enable", _SYSTEMD_SERVICE_NAME]):
@@ -255,17 +249,31 @@ def _cmd(args, timeout: float | None = None, check: bool = False) -> str | None:
         return None
 
 
-def _run_ok(args, timeout: float | None = None, capture_output: bool = True) -> bool:
+def _run_ok(
+    args,
+    timeout: float | None = None,
+    capture_output: bool = True,
+    input: bytes | str | None = None,
+) -> bool:
     kwargs: dict[str, Any] = {"check": True}
     if capture_output:
         kwargs["capture_output"] = True
     if timeout is not None:
         kwargs["timeout"] = timeout
+    if input is not None:
+        kwargs["input"] = input
     try:
         res = subprocess.run(args, **kwargs)
         return res.returncode == 0
     except Exception:
         return False
+
+
+def _sudo_write_file(path: str, data: str | bytes) -> bool:
+    """Write data to path with root privileges via sudo python3."""
+    raw = data if isinstance(data, bytes) else data.encode("utf-8")
+    script = f"import sys; open({path!r}, 'wb').write(sys.stdin.buffer.read())"
+    return _run_ok(["sudo", "python3", "-c", script], input=raw)
 
 
 def is_admin():
@@ -375,6 +383,43 @@ def get_macos_service_name(interface):
     return "Wi-Fi"
 
 
+def get_macos_awdl_status() -> dict[str, bool]:
+    """Check whether awdl0 and llw0 interfaces are active/UP on macOS."""
+    status = {"awdl0": False, "llw0": False}
+    if OS_NAME != "Darwin":
+        return status
+    for iface in ("awdl0", "llw0"):
+        res = _cmd(["ifconfig", iface], timeout=0.5)
+        if res:
+            lines = res.splitlines()
+            first_line = lines[0] if lines else ""
+            if "<" in first_line and ">" in first_line:
+                flags = first_line.split("<", 1)[1].split(">", 1)[0].split(",")
+                if "UP" in flags:
+                    status[iface] = True
+            elif "status: active" in res:
+                status[iface] = True
+    return status
+
+
+def set_macos_awdl(enable: bool) -> bool:
+    """Enable or disable awdl0 and llw0 interfaces on macOS."""
+    if OS_NAME != "Darwin":
+        return False
+    state_str = "up" if enable else "down"
+    action_str = "Enabling" if enable else "Disabling"
+    print(f"[*] {action_str} Apple Wireless Direct Link (AWDL / AirDrop)...")
+    success = True
+    for iface in ("awdl0", "llw0"):
+        res = _cmd(["ifconfig", iface], timeout=0.5)
+        if res:  # interface exists
+            ok = _run_ok(["sudo", "ifconfig", iface, state_str])
+            if not ok:
+                _warn(f"Failed to set {iface} to {state_str}.")
+                success = False
+    return success
+
+
 def get_macos_wifi_details(interface="en0"):
     details = {}
     res = _cmd(["ipconfig", "getsummary", interface], timeout=1.0)
@@ -396,6 +441,12 @@ def get_macos_wifi_details(interface="en0"):
         res = _cmd(["networksetup", "-getairportnetwork", interface], timeout=1.0)
         if res and "Current Wi-Fi Network:" in res:
             details["SSID"] = res.split("Current Wi-Fi Network:", 1)[1].strip()
+
+    awdl_st = get_macos_awdl_status()
+    active_awdl = [k for k, v in awdl_st.items() if v]
+    details["AWDL (AirDrop)"] = (
+        f"Active ({', '.join(active_awdl)})" if active_awdl else "Inactive / Disabled"
+    )
 
     return details
 
@@ -1189,6 +1240,7 @@ def save_backup(interface: str) -> None:
         "power_save": True,
     }
     if OS_NAME == "Darwin":
+        backup["awdl_status"] = get_macos_awdl_status()
         for key in _MACOS_SYSCTL_DEFAULTS:
             backup["sysctl"][key] = get_sysctl_value(key)
     elif is_bsd():
@@ -1345,6 +1397,13 @@ def revert_optimizations(interface: str) -> None:
             print(f"    System sleep restored to {sleep_val}.")
         except Exception as e:
             _warn(f"Failed to restore system sleep on macOS: {e}")
+        if backup and "awdl_status" in backup:
+            awdl_status = backup.get("awdl_status", {})
+            if any(awdl_status.values()):
+                print("[*] Restoring AWDL (AirDrop/Sidecar) interfaces...")
+                for iface, was_up in awdl_status.items():
+                    if was_up:
+                        _run_ok(["sudo", "ifconfig", iface, "up"])
     elif _is_linux_or_bsd():
         try:
             if OS_NAME == "Linux":
@@ -1432,7 +1491,17 @@ def main():
     parser.add_argument(
         "--gaming",
         action="store_true",
-        help="Disable TCP delayed ACK for lower latency (trades bulk throughput).",
+        help="Disable TCP delayed ACK and AWDL (macOS) for lower latency.",
+    )
+    parser.add_argument(
+        "--disable-awdl",
+        action="store_true",
+        help="Disable Apple Wireless Direct Link (awdl0/llw0) on macOS to prevent Wi-Fi latency spikes.",
+    )
+    parser.add_argument(
+        "--enable-awdl",
+        action="store_true",
+        help="Re-enable Apple Wireless Direct Link (awdl0/llw0) on macOS.",
     )
     parser.add_argument(
         "--revert",
@@ -1476,6 +1545,11 @@ def main():
 
     interface = get_wifi_interface()
 
+    if args.enable_awdl:
+        ensure_admin()
+        ok = set_macos_awdl(True)
+        sys.exit(0 if ok else 1)
+
     if args.revert:
         ensure_admin()
         revert_optimizations(interface)
@@ -1483,7 +1557,7 @@ def main():
 
     if args.install_daemon:
         ensure_admin()
-        ok = install_daemon(gaming=args.gaming)
+        ok = install_daemon(gaming=args.gaming, disable_awdl=args.disable_awdl)
         sys.exit(0 if ok else 1)
 
     if args.uninstall_daemon:
@@ -1540,6 +1614,8 @@ def main():
     # 4. Save backup before applying optimizations
     save_backup(interface)
 
+    should_disable_awdl = OS_NAME == "Darwin" and (args.disable_awdl or args.gaming)
+
     if args.json:
         dns_ips = [fastest_dns[1]["ip"]] if fastest_dns else []
         if fallback_dns:
@@ -1550,6 +1626,8 @@ def main():
         flush_dns_cache()
         apply_sysctl_optimizations(gaming=args.gaming)
         apply_power_save_optimization(interface, gaming=args.gaming)
+        if should_disable_awdl:
+            set_macos_awdl(False)
         if OS_NAME == "Windows":
             set_windows_roaming_aggressiveness(interface, "2")
         out = {
@@ -1566,6 +1644,7 @@ def main():
                 "dns_cache_flushed": True,
                 "sysctl_tuned": True,
                 "power_save_configured": True,
+                "awdl_disabled": should_disable_awdl,
             },
         }
         print(json.dumps(out, indent=2))
@@ -1573,7 +1652,7 @@ def main():
 
     print(f"wifituner: Analyzing {interface} ({OS_NAME})")
     if args.gaming:
-        print("note: Gaming mode active (disabled TCP delayed ACK and adapter sleep).")
+        print("note: Gaming mode active (disabled TCP delayed ACK, adapter sleep, and AWDL).")
 
     if wifi_details:
         print("\nActive Wi-Fi connection:")
@@ -1625,6 +1704,11 @@ def main():
     if OS_NAME == "Windows":
         set_windows_roaming_aggressiveness(interface, "2")
         print("  Roaming     Set roaming aggressiveness to Medium-Low")
+
+    # 5f. Apply AWDL optimization on macOS
+    if should_disable_awdl:
+        set_macos_awdl(False)
+        print("  AWDL        Disabled awdl0/llw0 interfaces (prevents ping spikes)")
 
     if wifi_details:
         sec = wifi_details.get("Security", "")
